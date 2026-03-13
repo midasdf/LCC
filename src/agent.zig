@@ -39,6 +39,18 @@ pub const Agent = struct {
         };
     }
 
+    /// Save session_id to long-lived allocator (survives arena reset)
+    fn saveSessionId(self: *Agent, sid: []const u8) void {
+        if (sid.len == 0) return;
+        // Free old session_id if we own it
+        if (self.session_id) |old_sid| {
+            if (old_sid.len > 0) {
+                self.alloc.free(old_sid);
+            }
+        }
+        self.session_id = self.alloc.dupe(u8, sid) catch null;
+    }
+
     /// Send a user message and stream the response
     pub fn processUserMessage(self: *Agent, user_input: []const u8) !void {
         try self.ensureProcess();
@@ -85,7 +97,6 @@ pub const Agent = struct {
                     if (!got_first_content) {
                         got_first_content = true;
                         terminal.clearSpinner();
-                        // Mark any pending tool as done
                         if (current_tool) |tool_name| {
                             terminal.printToolDone(self.alloc, tool_name);
                             current_tool = null;
@@ -98,30 +109,26 @@ pub const Agent = struct {
                     if (!got_first_content) {
                         terminal.clearSpinner();
                     }
-                    // Mark previous tool as done
                     if (current_tool) |tool_name| {
                         terminal.printToolDone(self.alloc, tool_name);
                     }
-                    current_tool = data.name;
+                    // Dupe tool name to parent alloc so it survives arena reset
+                    current_tool = self.alloc.dupe(u8, data.name) catch null;
                     got_first_content = false;
                     terminal.printToolStart(self.alloc, data.name);
                 },
                 .init => |data| {
-                    if (data.session_id.len > 0) {
-                        self.session_id = data.session_id;
-                    }
+                    self.saveSessionId(data.session_id);
                     terminal.printSessionInfo(self.alloc, data.session_id, data.model);
                 },
                 .result => |data| {
-                    // Mark any pending tool as done
                     if (current_tool) |tool_name| {
                         terminal.clearSpinner();
                         terminal.printToolDone(self.alloc, tool_name);
+                        self.alloc.free(tool_name);
                     }
 
-                    if (data.session_id.len > 0) {
-                        self.session_id = data.session_id;
-                    }
+                    self.saveSessionId(data.session_id);
                     self.total_cost_usd += data.cost_usd;
                     self.total_duration_ms += data.duration_ms;
 
@@ -130,6 +137,10 @@ pub const Agent = struct {
                     }
 
                     terminal.printCost(self.alloc, data.cost_usd, data.duration_ms, self.total_cost_usd);
+
+                    // Reset turn arena - frees all JSON parse memory from this turn
+                    proc.resetTurnArena();
+
                     return; // Turn complete, back to REPL
                 },
                 .unknown => {},

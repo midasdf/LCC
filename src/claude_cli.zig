@@ -41,58 +41,66 @@ pub const ResultData = struct {
 /// Persistent claude CLI subprocess
 pub const Process = struct {
     child: std.process.Child,
-    alloc: std.mem.Allocator,
+    /// Long-lived allocator (for things that survive across turns)
+    parent_alloc: std.mem.Allocator,
+    /// Per-turn arena allocator (reset after each result)
+    arena: std.heap.ArenaAllocator,
     session_id: []const u8,
     line_buf: std.ArrayList(u8),
     env_map: std.process.EnvMap,
     alive: bool,
 
-    pub fn start(alloc: std.mem.Allocator, config: Config) !Process {
+    /// Get the per-turn allocator (freed on resetTurnArena)
+    fn turnAlloc(self: *Process) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    pub fn start(parent_alloc: std.mem.Allocator, config: Config) !Process {
         var argv_list: std.ArrayList([]const u8) = .empty;
 
-        try argv_list.append(alloc, "claude");
-        try argv_list.append(alloc, "-p");
-        try argv_list.append(alloc, "--output-format");
-        try argv_list.append(alloc, "stream-json");
-        try argv_list.append(alloc, "--input-format");
-        try argv_list.append(alloc, "stream-json");
-        try argv_list.append(alloc, "--verbose");
-        try argv_list.append(alloc, "--include-partial-messages");
+        try argv_list.append(parent_alloc, "claude");
+        try argv_list.append(parent_alloc, "-p");
+        try argv_list.append(parent_alloc, "--output-format");
+        try argv_list.append(parent_alloc, "stream-json");
+        try argv_list.append(parent_alloc, "--input-format");
+        try argv_list.append(parent_alloc, "stream-json");
+        try argv_list.append(parent_alloc, "--verbose");
+        try argv_list.append(parent_alloc, "--include-partial-messages");
 
         if (config.model) |m| {
-            try argv_list.append(alloc, "--model");
-            try argv_list.append(alloc, m);
+            try argv_list.append(parent_alloc, "--model");
+            try argv_list.append(parent_alloc, m);
         }
         if (config.max_turns) |mt| {
-            const s = try std.fmt.allocPrint(alloc, "{d}", .{mt});
-            try argv_list.append(alloc, "--max-turns");
-            try argv_list.append(alloc, s);
+            const s = try std.fmt.allocPrint(parent_alloc, "{d}", .{mt});
+            try argv_list.append(parent_alloc, "--max-turns");
+            try argv_list.append(parent_alloc, s);
         }
         if (config.resume_session_id) |sid| {
-            try argv_list.append(alloc, "--resume");
-            try argv_list.append(alloc, sid);
+            try argv_list.append(parent_alloc, "--resume");
+            try argv_list.append(parent_alloc, sid);
         }
         if (config.system_prompt) |sp| {
-            try argv_list.append(alloc, "--append-system-prompt");
-            try argv_list.append(alloc, sp);
+            try argv_list.append(parent_alloc, "--append-system-prompt");
+            try argv_list.append(parent_alloc, sp);
         }
         if (config.allowed_tools) |at| {
-            try argv_list.append(alloc, "--allowedTools");
-            try argv_list.append(alloc, at);
+            try argv_list.append(parent_alloc, "--allowedTools");
+            try argv_list.append(parent_alloc, at);
         }
         if (config.permission_mode) |pm| {
-            try argv_list.append(alloc, "--permission-mode");
-            try argv_list.append(alloc, pm);
+            try argv_list.append(parent_alloc, "--permission-mode");
+            try argv_list.append(parent_alloc, pm);
         }
 
         // Initial prompt required by -p; use empty string since we send via stdin
-        try argv_list.append(alloc, "");
+        try argv_list.append(parent_alloc, "");
 
-        const argv = try argv_list.toOwnedSlice(alloc);
+        const argv = try argv_list.toOwnedSlice(parent_alloc);
 
         // Build env without CLAUDECODE to allow nested invocation
-        var env_map = std.process.EnvMap.init(alloc);
-        const env_vars = std.process.getEnvMap(alloc) catch return error.EnvError;
+        var env_map = std.process.EnvMap.init(parent_alloc);
+        const env_vars = std.process.getEnvMap(parent_alloc) catch return error.EnvError;
         var env_it = env_vars.iterator();
         while (env_it.next()) |entry| {
             if (std.mem.eql(u8, entry.key_ptr.*, "CLAUDECODE")) continue;
@@ -102,14 +110,15 @@ pub const Process = struct {
 
         var self = Process{
             .child = undefined,
-            .alloc = alloc,
+            .parent_alloc = parent_alloc,
+            .arena = std.heap.ArenaAllocator.init(parent_alloc),
             .session_id = "",
             .line_buf = .empty,
             .env_map = env_map,
             .alive = false,
         };
 
-        self.child = std.process.Child.init(argv, alloc);
+        self.child = std.process.Child.init(argv, parent_alloc);
         self.child.env_map = &self.env_map;
         self.child.stdin_behavior = .Pipe;
         self.child.stdout_behavior = .Pipe;
@@ -121,22 +130,23 @@ pub const Process = struct {
         return self;
     }
 
-    /// Send a user message via stdin (NDJSON)
+    /// Send a user message via stdin (NDJSON). Uses turn arena (freed on reset).
     pub fn sendMessage(self: *Process, content: []const u8) !void {
         if (!self.alive) return error.ProcessDead;
 
         const stdin = self.child.stdin orelse return error.ProcessDead;
+        const alloc = self.turnAlloc();
 
         // Build: {"type":"user","message":{"role":"user","content":"..."}}
-        var msg_obj = jh.object(self.alloc);
+        var msg_obj = jh.object(alloc);
         try msg_obj.put("role", jh.string("user"));
         try msg_obj.put("content", jh.string(content));
 
-        var outer = jh.object(self.alloc);
+        var outer = jh.object(alloc);
         try outer.put("type", jh.string("user"));
         try outer.put("message", .{ .object = msg_obj });
 
-        const json_str = try jh.stringify(self.alloc, .{ .object = outer });
+        const json_str = try jh.stringify(alloc, .{ .object = outer });
 
         _ = stdin.write(json_str) catch |err| {
             self.alive = false;
@@ -149,25 +159,38 @@ pub const Process = struct {
     }
 
     /// Read the next event from stdout. Returns null on EOF (process died).
+    /// Returned event data is valid until the next call to resetTurnArena().
     pub fn readEvent(self: *Process) !?Event {
         if (!self.alive) return null;
 
         const stdout = self.child.stdout orelse return null;
+        const alloc = self.turnAlloc();
 
         while (true) {
             // Check if we already have a complete line in the buffer
             if (std.mem.indexOf(u8, self.line_buf.items, "\n")) |nl_pos| {
-                const line = try self.alloc.dupe(u8, self.line_buf.items[0..nl_pos]);
-                // Remove processed line from buffer
+                const line = self.line_buf.items[0..nl_pos];
+
+                if (line.len > 0) {
+                    // Parse before modifying line_buf (line points into it)
+                    const event = parseLine(alloc, line);
+
+                    // Remove processed line from buffer
+                    const remaining = self.line_buf.items.len - nl_pos - 1;
+                    if (remaining > 0) {
+                        std.mem.copyForwards(u8, self.line_buf.items[0..remaining], self.line_buf.items[nl_pos + 1 ..]);
+                    }
+                    self.line_buf.items.len = remaining;
+
+                    return event;
+                }
+
+                // Empty line, skip it
                 const remaining = self.line_buf.items.len - nl_pos - 1;
                 if (remaining > 0) {
                     std.mem.copyForwards(u8, self.line_buf.items[0..remaining], self.line_buf.items[nl_pos + 1 ..]);
                 }
                 self.line_buf.items.len = remaining;
-
-                if (line.len > 0) {
-                    return parseLine(self.alloc, line);
-                }
                 continue;
             }
 
@@ -184,8 +207,14 @@ pub const Process = struct {
                 return null;
             }
 
-            try self.line_buf.appendSlice(self.alloc, buf[0..n]);
+            try self.line_buf.appendSlice(self.parent_alloc, buf[0..n]);
         }
+    }
+
+    /// Reset the per-turn arena, freeing all JSON parse/stringify memory.
+    /// Call after processing a complete turn (result event received).
+    pub fn resetTurnArena(self: *Process) void {
+        _ = self.arena.reset(.retain_capacity);
     }
 
     /// Kill the subprocess
@@ -209,7 +238,8 @@ pub const Process = struct {
 
     pub fn deinit(self: *Process) void {
         self.kill();
-        self.line_buf.deinit(self.alloc);
+        self.line_buf.deinit(self.parent_alloc);
+        self.arena.deinit();
     }
 };
 
@@ -223,7 +253,6 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
             .model = jh.getString(parsed.value, "model") orelse "",
         } };
     } else if (std.mem.eql(u8, event_type, "stream_event")) {
-        // Real-time streaming events
         const inner = jh.getObject(parsed.value, "event") orelse return .unknown;
         const inner_type = jh.getString(inner, "type") orelse return .unknown;
 

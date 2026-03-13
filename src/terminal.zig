@@ -138,6 +138,8 @@ pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
 
     while (true) {
         var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(alloc);
+
         while (true) {
             var byte: [1]u8 = undefined;
             const n = stdin.read(&byte) catch |err| {
@@ -160,7 +162,7 @@ pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
             return try alloc.dupe(u8, "");
         }
 
-        // Append line
+        // Append line contents to output, then line is freed by defer
         if (lines.items.len > 0) try lines.append(alloc, '\n');
         try lines.appendSlice(alloc, line.items);
 
