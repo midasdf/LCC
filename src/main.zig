@@ -2,6 +2,7 @@ const std = @import("std");
 const terminal = @import("terminal.zig");
 const agent_mod = @import("agent.zig");
 const claude_cli = @import("claude_cli.zig");
+const settings = @import("settings.zig");
 
 // Module-level globals for signal handler (must be accessible from C callconv)
 var g_interrupted: *std.atomic.Value(bool) = undefined;
@@ -66,6 +67,13 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
+        }
+    }
+
+    // Apply preferredLanguage from ~/.claude/settings.json
+    if (config.system_prompt == null) {
+        if (settings.readPreferredLanguage(alloc)) |lang| {
+            config.system_prompt = std.fmt.allocPrint(alloc, "IMPORTANT: You must respond in {s}.", .{lang}) catch null;
         }
     }
 
