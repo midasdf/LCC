@@ -130,29 +130,43 @@ pub const Process = struct {
         return self;
     }
 
-    /// Send a user message via stdin (NDJSON). Uses turn arena (freed on reset).
+    /// Send a user message via stdin (NDJSON). Uses stack buffer + direct write.
     pub fn sendMessage(self: *Process, content: []const u8) !void {
         if (!self.alive) return error.ProcessDead;
 
         const stdin = self.child.stdin orelse return error.ProcessDead;
-        const alloc = self.turnAlloc();
 
-        // Build: {"type":"user","message":{"role":"user","content":"..."}}
-        var msg_obj = jh.object(alloc);
-        try msg_obj.put("role", jh.string("user"));
-        try msg_obj.put("content", jh.string(content));
-
-        var outer = jh.object(alloc);
-        try outer.put("type", jh.string("user"));
-        try outer.put("message", .{ .object = msg_obj });
-
-        const json_str = try jh.stringify(alloc, .{ .object = outer });
-
-        _ = stdin.write(json_str) catch |err| {
+        // Write prefix
+        _ = stdin.write("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"") catch |err| {
             self.alive = false;
             return err;
         };
-        _ = stdin.write("\n") catch |err| {
+
+        // Write content with JSON escaping (no heap allocation)
+        for (content) |c| {
+            const escaped: ?[]const u8 = switch (c) {
+                '"' => "\\\"",
+                '\\' => "\\\\",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                '\t' => "\\t",
+                else => null,
+            };
+            if (escaped) |esc| {
+                _ = stdin.write(esc) catch |err| {
+                    self.alive = false;
+                    return err;
+                };
+            } else {
+                _ = stdin.write(&.{c}) catch |err| {
+                    self.alive = false;
+                    return err;
+                };
+            }
+        }
+
+        // Write suffix + newline
+        _ = stdin.write("\"}}\n") catch |err| {
             self.alive = false;
             return err;
         };
@@ -244,6 +258,33 @@ pub const Process = struct {
 };
 
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
+    // Fast path: content_block_delta is the most frequent event during streaming.
+    // Extract text directly with string search instead of full JSON parse.
+    if (std.mem.indexOf(u8, line, "\"text_delta\"")) |_| {
+        if (std.mem.indexOf(u8, line, "\"text\":\"")) |text_start| {
+            const start = text_start + 8; // length of "text":"
+            if (start < line.len) {
+                // Find closing quote (handle escaped quotes)
+                var i = start;
+                while (i < line.len) : (i += 1) {
+                    if (line[i] == '\\') {
+                        i += 1; // skip escaped char
+                        continue;
+                    }
+                    if (line[i] == '"') break;
+                }
+                if (i <= line.len) {
+                    const raw = line[start..i];
+                    // If no escapes, return directly (common case)
+                    if (std.mem.indexOf(u8, raw, "\\") == null) {
+                        return .{ .content_delta = raw };
+                    }
+                    // Has escapes: fall through to full JSON parse
+                }
+            }
+        }
+    }
+
     const parsed = jh.parse(alloc, line) catch return .unknown;
     const event_type = jh.getString(parsed.value, "type") orelse return .unknown;
 

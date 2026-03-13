@@ -27,14 +27,13 @@ pub const Agent = struct {
     pub fn ensureProcess(self: *Agent) !void {
         if (self.process != null and self.process.?.alive) return;
 
-        // Set resume session_id if we have one from a previous process
         var config = self.config;
         if (self.session_id) |sid| {
             config.resume_session_id = sid;
         }
 
         self.process = claude_cli.Process.start(self.alloc, config) catch |err| {
-            terminal.printError(self.alloc, "Failed to start claude: {s}", .{@errorName(err)});
+            terminal.printError("Failed to start claude: {s}", .{@errorName(err)});
             return err;
         };
     }
@@ -42,7 +41,6 @@ pub const Agent = struct {
     /// Save session_id to long-lived allocator (survives arena reset)
     fn saveSessionId(self: *Agent, sid: []const u8) void {
         if (sid.len == 0) return;
-        // Free old session_id if we own it
         if (self.session_id) |old_sid| {
             if (old_sid.len > 0) {
                 self.alloc.free(old_sid);
@@ -58,22 +56,20 @@ pub const Agent = struct {
         var proc = &(self.process.?);
 
         proc.sendMessage(user_input) catch |err| {
-            terminal.printError(self.alloc, "Failed to send message: {s}", .{@errorName(err)});
+            terminal.printError("Failed to send message: {s}", .{@errorName(err)});
             self.process = null;
             return;
         };
 
-        // Show waiting indicator
         terminal.printWaiting();
 
         var got_first_content = false;
         var current_tool: ?[]const u8 = null;
 
-        // Event read loop
         while (true) {
-            // Check for interrupt
             if (self.interrupted.load(.acquire)) {
                 terminal.clearSpinner();
+                if (current_tool) |tn| self.alloc.free(tn);
                 proc.kill();
                 self.process = null;
                 terminal.printStr(terminal.Color.yellow ++ "\n  [interrupted]" ++ terminal.Color.reset ++ "\n");
@@ -82,11 +78,12 @@ pub const Agent = struct {
 
             const event = proc.readEvent() catch {
                 terminal.clearSpinner();
+                if (current_tool) |tn| self.alloc.free(tn);
                 self.process = null;
                 return;
             } orelse {
-                // EOF - process died
                 terminal.clearSpinner();
+                if (current_tool) |tn| self.alloc.free(tn);
                 self.process = null;
                 terminal.printStr(terminal.Color.yellow ++ "\n  [process ended]" ++ terminal.Color.reset ++ "\n");
                 return;
@@ -97,8 +94,9 @@ pub const Agent = struct {
                     if (!got_first_content) {
                         got_first_content = true;
                         terminal.clearSpinner();
-                        if (current_tool) |tool_name| {
-                            terminal.printToolDone(self.alloc, tool_name);
+                        if (current_tool) |tn| {
+                            terminal.printToolDone(tn);
+                            self.alloc.free(tn);
                             current_tool = null;
                         }
                         terminal.printResponseHeader();
@@ -109,23 +107,23 @@ pub const Agent = struct {
                     if (!got_first_content) {
                         terminal.clearSpinner();
                     }
-                    if (current_tool) |tool_name| {
-                        terminal.printToolDone(self.alloc, tool_name);
+                    if (current_tool) |tn| {
+                        terminal.printToolDone(tn);
+                        self.alloc.free(tn);
                     }
-                    // Dupe tool name to parent alloc so it survives arena reset
                     current_tool = self.alloc.dupe(u8, data.name) catch null;
                     got_first_content = false;
-                    terminal.printToolStart(self.alloc, data.name);
+                    terminal.printToolStart(data.name);
                 },
                 .init => |data| {
                     self.saveSessionId(data.session_id);
-                    terminal.printSessionInfo(self.alloc, data.session_id, data.model);
+                    terminal.printSessionInfo(data.session_id, data.model);
                 },
                 .result => |data| {
-                    if (current_tool) |tool_name| {
+                    if (current_tool) |tn| {
                         terminal.clearSpinner();
-                        terminal.printToolDone(self.alloc, tool_name);
-                        self.alloc.free(tool_name);
+                        terminal.printToolDone(tn);
+                        self.alloc.free(tn);
                     }
 
                     self.saveSessionId(data.session_id);
@@ -133,15 +131,15 @@ pub const Agent = struct {
                     self.total_duration_ms += data.duration_ms;
 
                     if (data.is_error) {
-                        terminal.printError(self.alloc, "{s}", .{data.result_text});
+                        terminal.printError("{s}", .{data.result_text});
                     }
 
-                    terminal.printCost(self.alloc, data.cost_usd, data.duration_ms, self.total_cost_usd);
+                    terminal.printCost(data.cost_usd, data.duration_ms, self.total_cost_usd);
 
                     // Reset turn arena - frees all JSON parse memory from this turn
                     proc.resetTurnArena();
 
-                    return; // Turn complete, back to REPL
+                    return;
                 },
                 .unknown => {},
             }
@@ -162,6 +160,6 @@ pub const Agent = struct {
             proc.deinit();
             self.process = null;
         }
-        terminal.printSessionSummary(self.alloc, self.total_cost_usd, self.total_duration_ms);
+        terminal.printSessionSummary(self.total_cost_usd, self.total_duration_ms);
     }
 };

@@ -65,7 +65,7 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // Print banner
-    terminal.printBanner(alloc, config.model);
+    terminal.printBanner(config.model);
 
     // Initialize agent
     var agent = agent_mod.Agent.init(alloc, config, &interrupted);
@@ -80,10 +80,11 @@ pub fn main() !void {
         terminal.printPrompt();
 
         const input = terminal.readMultilineInput(alloc) catch |err| {
-            terminal.printError(alloc, "Input error: {s}", .{@errorName(err)});
+            terminal.printError("Input error: {s}", .{@errorName(err)});
             continue;
         } orelse break; // EOF
 
+        defer alloc.free(input);
         const trimmed = std.mem.trim(u8, input, " \t\n\r");
         if (trimmed.len == 0) continue;
 
@@ -92,7 +93,7 @@ pub fn main() !void {
         }
 
         agent.processUserMessage(trimmed) catch |err| {
-            terminal.printError(alloc, "Error: {s}", .{@errorName(err)});
+            terminal.printError("Error: {s}", .{@errorName(err)});
         };
     }
 
