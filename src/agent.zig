@@ -33,8 +33,6 @@ pub const Agent = struct {
             config.resume_session_id = sid;
         }
 
-        terminal.print(self.alloc, terminal.Color.gray ++ "Starting claude..." ++ terminal.Color.reset ++ "\n", .{});
-
         self.process = claude_cli.Process.start(self.alloc, config) catch |err| {
             terminal.printError(self.alloc, "Failed to start claude: {s}", .{@errorName(err)});
             return err;
@@ -53,40 +51,74 @@ pub const Agent = struct {
             return;
         };
 
+        // Show waiting indicator
+        terminal.printWaiting();
+
+        var got_first_content = false;
+        var current_tool: ?[]const u8 = null;
+
         // Event read loop
         while (true) {
             // Check for interrupt
             if (self.interrupted.load(.acquire)) {
+                terminal.clearSpinner();
                 proc.kill();
                 self.process = null;
-                terminal.printStr("\n" ++ terminal.Color.yellow ++ "[interrupted]" ++ terminal.Color.reset ++ "\n");
+                terminal.printStr(terminal.Color.yellow ++ "\n  [interrupted]" ++ terminal.Color.reset ++ "\n");
                 return;
             }
 
             const event = proc.readEvent() catch {
+                terminal.clearSpinner();
                 self.process = null;
                 return;
             } orelse {
                 // EOF - process died
+                terminal.clearSpinner();
                 self.process = null;
-                terminal.printStr("\n" ++ terminal.Color.yellow ++ "[process ended]" ++ terminal.Color.reset ++ "\n");
+                terminal.printStr(terminal.Color.yellow ++ "\n  [process ended]" ++ terminal.Color.reset ++ "\n");
                 return;
             };
 
             switch (event) {
                 .content_delta => |text| {
+                    if (!got_first_content) {
+                        got_first_content = true;
+                        terminal.clearSpinner();
+                        // Mark any pending tool as done
+                        if (current_tool) |tool_name| {
+                            terminal.printToolDone(self.alloc, tool_name);
+                            current_tool = null;
+                        }
+                        terminal.printResponseHeader();
+                    }
                     terminal.printStreaming(text);
                 },
                 .tool_start => |data| {
-                    terminal.printTool(self.alloc, data.name, "running...");
+                    if (!got_first_content) {
+                        terminal.clearSpinner();
+                    }
+                    // Mark previous tool as done
+                    if (current_tool) |tool_name| {
+                        terminal.printToolDone(self.alloc, tool_name);
+                    }
+                    current_tool = data.name;
+                    got_first_content = false;
+                    terminal.printToolStart(self.alloc, data.name);
                 },
                 .init => |data| {
                     if (data.session_id.len > 0) {
                         self.session_id = data.session_id;
                     }
-                    terminal.print(self.alloc, terminal.Color.gray ++ "Session: {s} | Model: {s}" ++ terminal.Color.reset ++ "\n", .{ data.session_id, data.model });
+                    terminal.printSessionInfo(self.alloc, data.session_id, data.model);
                 },
                 .result => |data| {
+                    // Mark any pending tool as done
+                    if (current_tool) |tool_name| {
+                        terminal.clearSpinner();
+                        terminal.printToolDone(self.alloc, tool_name);
+                    }
+
                     if (data.session_id.len > 0) {
                         self.session_id = data.session_id;
                     }
@@ -98,7 +130,6 @@ pub const Agent = struct {
                     }
 
                     terminal.printCost(self.alloc, data.cost_usd, data.duration_ms, self.total_cost_usd);
-                    terminal.printStr("\n");
                     return; // Turn complete, back to REPL
                 },
                 .unknown => {},
@@ -120,8 +151,6 @@ pub const Agent = struct {
             proc.deinit();
             self.process = null;
         }
-        if (self.total_cost_usd > 0) {
-            terminal.print(self.alloc, terminal.Color.gray ++ "Session total: ${d:.4} | {d}ms" ++ terminal.Color.reset ++ "\n", .{ self.total_cost_usd, self.total_duration_ms });
-        }
+        terminal.printSessionSummary(self.alloc, self.total_cost_usd, self.total_duration_ms);
     }
 };

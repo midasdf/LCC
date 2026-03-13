@@ -65,8 +65,7 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // Print banner
-    terminal.print(alloc, terminal.Color.bold ++ terminal.Color.cyan ++ "LCC" ++ terminal.Color.reset ++ " - Lightweight Claude Code Wrapper\n", .{});
-    terminal.print(alloc, terminal.Color.gray ++ "Type your message. Empty line to send. Ctrl+C to interrupt. 'exit' to quit." ++ terminal.Color.reset ++ "\n", .{});
+    terminal.printBanner(alloc, config.model);
 
     // Initialize agent
     var agent = agent_mod.Agent.init(alloc, config, &interrupted);
@@ -98,7 +97,7 @@ pub fn main() !void {
     }
 
     agent.shutdown();
-    terminal.print(alloc, terminal.Color.gray ++ "Goodbye!" ++ terminal.Color.reset ++ "\n", .{});
+    terminal.printStr(terminal.Color.gray ++ "  Goodbye!" ++ terminal.Color.reset ++ "\n\n");
 }
 
 fn printHelp() void {
