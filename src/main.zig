@@ -43,10 +43,26 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "--allowed-tools")) {
             config.allowed_tools = args.next();
+        } else if (std.mem.eql(u8, arg, "--disallowed-tools")) {
+            config.disallowed_tools = args.next();
         } else if (std.mem.eql(u8, arg, "--permission-mode")) {
             config.permission_mode = args.next();
         } else if (std.mem.eql(u8, arg, "--system-prompt")) {
             config.system_prompt = args.next();
+        } else if (std.mem.eql(u8, arg, "--continue") or std.mem.eql(u8, arg, "-c")) {
+            config.continue_session = true;
+        } else if (std.mem.eql(u8, arg, "--effort")) {
+            config.effort = args.next();
+        } else if (std.mem.eql(u8, arg, "--max-budget-usd")) {
+            config.max_budget_usd = args.next();
+        } else if (std.mem.eql(u8, arg, "--tools")) {
+            config.tools = args.next();
+        } else if (std.mem.eql(u8, arg, "--add-dir")) {
+            config.add_dir = args.next();
+        } else if (std.mem.eql(u8, arg, "--cwd")) {
+            config.cwd = args.next();
+        } else if (std.mem.eql(u8, arg, "--quiet") or std.mem.eql(u8, arg, "-q")) {
+            config.quiet = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -64,12 +80,36 @@ pub fn main() !void {
     };
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
-    // Print banner
-    terminal.printBanner(config.model);
-
     // Initialize agent
     var agent = agent_mod.Agent.init(alloc, config, &interrupted);
     g_agent = &agent;
+
+    // Check if stdin is piped (non-interactive)
+    if (!terminal.isInteractive()) {
+        // Pipe mode: read all stdin, send as single message
+        const input = terminal.readPipedInput(alloc) catch |err| {
+            terminal.printError("Input error: {s}", .{@errorName(err)});
+            return;
+        } orelse {
+            terminal.printError("No input received from pipe.", .{});
+            return;
+        };
+        defer alloc.free(input);
+
+        const trimmed = std.mem.trim(u8, input, " \t\n\r");
+        if (trimmed.len == 0) return;
+
+        agent.processUserMessage(trimmed) catch |err| {
+            terminal.printError("Error: {s}", .{@errorName(err)});
+        };
+        agent.shutdown();
+        return;
+    }
+
+    // Interactive mode
+    if (!config.quiet) {
+        terminal.printBanner(config.model);
+    }
 
     // REPL loop
     while (true) {
@@ -88,8 +128,31 @@ pub fn main() !void {
         const trimmed = std.mem.trim(u8, input, " \t\n\r");
         if (trimmed.len == 0) continue;
 
+        // Built-in commands
         if (std.mem.eql(u8, trimmed, "exit") or std.mem.eql(u8, trimmed, "quit")) {
             break;
+        } else if (std.mem.eql(u8, trimmed, "/help") or std.mem.eql(u8, trimmed, "?")) {
+            terminal.printReplHelp();
+            continue;
+        } else if (std.mem.eql(u8, trimmed, "/cost")) {
+            agent.printCostSummary();
+            continue;
+        } else if (std.mem.eql(u8, trimmed, "/session")) {
+            agent.printSessionInfo();
+            continue;
+        } else if (std.mem.eql(u8, trimmed, "/clear")) {
+            terminal.clearScreen();
+            continue;
+        } else if (std.mem.eql(u8, trimmed, "/retry")) {
+            if (agent.getLastMessage()) |last| {
+                terminal.printStr(terminal.Color.gray ++ "  Retrying last message..." ++ terminal.Color.reset ++ "\n");
+                agent.processUserMessage(last) catch |err| {
+                    terminal.printError("Error: {s}", .{@errorName(err)});
+                };
+            } else {
+                terminal.printStr(terminal.Color.gray ++ "  No previous message to retry." ++ terminal.Color.reset ++ "\n");
+            }
+            continue;
         }
 
         agent.processUserMessage(trimmed) catch |err| {
@@ -109,18 +172,36 @@ fn printHelp() void {
         \\Requires `claude` CLI to be installed and authenticated.
         \\
         \\Usage: lcc [options]
+        \\       echo "prompt" | lcc [options]
         \\
         \\Options:
         \\  -m, --model <name>          Model to use (passed to claude CLI)
+        \\  -c, --continue              Resume most recent conversation
+        \\  -q, --quiet                 Suppress startup banner
         \\  --max-turns <n>             Max agent turns per message
+        \\  --effort <level>            Effort level (low, medium, high, max)
+        \\  --max-budget-usd <amount>   Maximum cost limit for session
+        \\  --tools <tools>             Explicitly enable tools (e.g. Bash,Edit,Read)
         \\  --allowed-tools <tools>     Comma-separated list of allowed tools
+        \\  --disallowed-tools <tools>  Deny specific tools
+        \\  --add-dir <dir>             Additional directory for tool access
+        \\  --cwd <dir>                 Working directory for file operations
         \\  --permission-mode <mode>    Permission mode (default, plan, auto, etc.)
         \\  --system-prompt <prompt>    Append to system prompt
         \\  -h, --help                  Show this help
         \\
-        \\Input:
-        \\  Type your message, then press Enter on an empty line to send.
-        \\  Ctrl+C once to interrupt, twice to quit.
+        \\REPL Commands:
+        \\  /help, ?     Show REPL help
+        \\  /cost        Show session cost summary
+        \\  /session     Show session info
+        \\  /clear       Clear screen
+        \\  /retry       Retry last message
+        \\  exit, quit   Exit LCC
+        \\
+        \\Pipe Mode:
+        \\  Reads all stdin and sends as a single message when piped.
+        \\  Example: echo "explain this code" | lcc
+        \\  Example: cat file.py | lcc --system-prompt "review this code"
         \\
         \\Environment:
         \\  Requires `claude` CLI authenticated via `claude auth` or MAX subscription.
@@ -128,8 +209,9 @@ fn printHelp() void {
         \\Examples:
         \\  lcc
         \\  lcc --model opus
-        \\  lcc --max-turns 5
-        \\  lcc --permission-mode auto
+        \\  lcc --continue
+        \\  lcc --effort low --max-budget-usd 1.00
+        \\  lcc --max-turns 5 --permission-mode auto
         \\
     );
 }

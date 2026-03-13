@@ -10,6 +10,7 @@ pub const Agent = struct {
     interrupted: *std.atomic.Value(bool),
     total_cost_usd: f64,
     total_duration_ms: i64,
+    last_message: ?[]const u8,
 
     pub fn init(alloc: std.mem.Allocator, config: claude_cli.Config, interrupted: *std.atomic.Value(bool)) Agent {
         return .{
@@ -20,6 +21,7 @@ pub const Agent = struct {
             .interrupted = interrupted,
             .total_cost_usd = 0,
             .total_duration_ms = 0,
+            .last_message = null,
         };
     }
 
@@ -30,10 +32,23 @@ pub const Agent = struct {
         var config = self.config;
         if (self.session_id) |sid| {
             config.resume_session_id = sid;
+            // Don't use --continue when we already have a session to resume
+            config.continue_session = false;
         }
 
         self.process = claude_cli.Process.start(self.alloc, config) catch |err| {
-            terminal.printError("Failed to start claude: {s}", .{@errorName(err)});
+            // Provide helpful error messages
+            switch (err) {
+                error.FileNotFound => {
+                    terminal.printError("claude CLI not found. Install it: npm install -g @anthropic-ai/claude-code", .{});
+                },
+                error.AccessDenied => {
+                    terminal.printError("Permission denied running claude CLI. Check file permissions.", .{});
+                },
+                else => {
+                    terminal.printError("Failed to start claude: {s}", .{@errorName(err)});
+                },
+            }
             return err;
         };
     }
@@ -49,8 +64,28 @@ pub const Agent = struct {
         self.session_id = self.alloc.dupe(u8, sid) catch null;
     }
 
+    /// Save last message for /retry
+    fn saveLastMessage(self: *Agent, msg: []const u8) void {
+        if (self.last_message) |old| {
+            self.alloc.free(old);
+        }
+        self.last_message = self.alloc.dupe(u8, msg) catch null;
+    }
+
+    /// Get last message (for /retry)
+    pub fn getLastMessage(self: *const Agent) ?[]const u8 {
+        return self.last_message;
+    }
+
+    /// Get session ID (for /session display)
+    pub fn getSessionId(self: *const Agent) ?[]const u8 {
+        return self.session_id;
+    }
+
     /// Send a user message and stream the response
     pub fn processUserMessage(self: *Agent, user_input: []const u8) !void {
+        self.saveLastMessage(user_input);
+
         try self.ensureProcess();
 
         var proc = &(self.process.?);
@@ -85,7 +120,8 @@ pub const Agent = struct {
                 terminal.clearSpinner();
                 if (current_tool) |tn| self.alloc.free(tn);
                 self.process = null;
-                terminal.printStr(terminal.Color.yellow ++ "\n  [process ended]" ++ terminal.Color.reset ++ "\n");
+                terminal.printStr(terminal.Color.yellow ++ "\n  [process ended unexpectedly]" ++ terminal.Color.reset ++ "\n");
+                terminal.printStr(terminal.Color.gray ++ "  Will restart on next message." ++ terminal.Color.reset ++ "\n");
                 return;
             };
 
@@ -114,6 +150,9 @@ pub const Agent = struct {
                     current_tool = self.alloc.dupe(u8, data.name) catch null;
                     got_first_content = false;
                     terminal.printToolStart(data.name);
+                },
+                .tool_result => {
+                    // tool_result events are handled implicitly via tool_start/done flow
                 },
                 .init => |data| {
                     self.saveSessionId(data.session_id);
@@ -154,11 +193,44 @@ pub const Agent = struct {
         return 0;
     }
 
+    /// Print cost info for /cost command
+    pub fn printCostSummary(self: *const Agent) void {
+        if (self.total_cost_usd > 0 or self.total_duration_ms > 0) {
+            const secs = @divTrunc(self.total_duration_ms, 1000);
+            terminal.print("\n" ++ terminal.Color.cyan ++ "  Session Cost" ++ terminal.Color.reset ++ "\n", .{});
+            terminal.print(terminal.Color.gray ++ "    total: ${d:.4} | {d}s" ++ terminal.Color.reset ++ "\n", .{ self.total_cost_usd, secs });
+        } else {
+            terminal.printStr("\n" ++ terminal.Color.gray ++ "  No cost data yet." ++ terminal.Color.reset ++ "\n");
+        }
+    }
+
+    /// Print session info for /session command
+    pub fn printSessionInfo(self: *const Agent) void {
+        terminal.printStr("\n" ++ terminal.Color.cyan ++ "  Session Info" ++ terminal.Color.reset ++ "\n");
+        if (self.session_id) |sid| {
+            terminal.print(terminal.Color.gray ++ "    id: {s}" ++ terminal.Color.reset ++ "\n", .{sid});
+        } else {
+            terminal.printStr(terminal.Color.gray ++ "    No active session." ++ terminal.Color.reset ++ "\n");
+        }
+        if (self.config.model) |m| {
+            terminal.print(terminal.Color.gray ++ "    model: {s}" ++ terminal.Color.reset ++ "\n", .{m});
+        }
+        if (self.process != null and self.process.?.alive) {
+            terminal.printStr(terminal.Color.green ++ "    status: connected" ++ terminal.Color.reset ++ "\n");
+        } else {
+            terminal.printStr(terminal.Color.yellow ++ "    status: disconnected" ++ terminal.Color.reset ++ "\n");
+        }
+    }
+
     /// Graceful shutdown
     pub fn shutdown(self: *Agent) void {
         if (self.process) |*proc| {
             proc.deinit();
             self.process = null;
+        }
+        if (self.last_message) |lm| {
+            self.alloc.free(lm);
+            self.last_message = null;
         }
         terminal.printSessionSummary(self.total_cost_usd, self.total_duration_ms);
     }

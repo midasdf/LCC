@@ -16,6 +16,7 @@ pub const Color = struct {
 
 // ANSI escape sequences
 const CLEAR_LINE = "\x1b[2K\r";
+const CLEAR_SCREEN = "\x1b[2J\x1b[H";
 
 fn getStdout() std.fs.File {
     return .{ .handle = std.posix.STDOUT_FILENO };
@@ -29,11 +30,15 @@ fn getStdin() std.fs.File {
     return .{ .handle = std.posix.STDIN_FILENO };
 }
 
+/// Check if stdin is a TTY (interactive terminal)
+pub fn isInteractive() bool {
+    return std.posix.isatty(std.posix.STDIN_FILENO);
+}
+
 /// Print formatted text to stdout using a stack buffer (no heap allocation)
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch {
-        // Fallback: just write what we can
         return;
     };
     _ = getStdout().write(s) catch {};
@@ -94,6 +99,11 @@ pub fn clearSpinner() void {
     printStr(CLEAR_LINE);
 }
 
+/// Clear screen
+pub fn clearScreen() void {
+    printStr(CLEAR_SCREEN);
+}
+
 /// Show waiting indicator
 pub fn printWaiting() void {
     printStr(Color.dim ++ "  thinking..." ++ Color.reset);
@@ -118,7 +128,7 @@ pub fn printBanner(model: ?[]const u8) void {
     if (model) |m| {
         print(Color.gray ++ "  model: {s}" ++ Color.reset ++ "\n", .{m});
     }
-    printStr(Color.gray ++ "  Enter to send | empty line = submit | Ctrl+C = stop | exit = quit" ++ Color.reset ++ "\n");
+    printStr(Color.gray ++ "  Type /help for commands | empty line = submit | Ctrl+C = stop" ++ Color.reset ++ "\n");
     printSeparator();
 }
 
@@ -137,28 +147,54 @@ pub fn printSessionSummary(total_cost: f64, total_duration_ms: i64) void {
     }
 }
 
+/// Print REPL help
+pub fn printReplHelp() void {
+    printStr("\n" ++ Color.bold ++ "  Commands:" ++ Color.reset ++ "\n");
+    printStr(Color.gray ++ "    /help           Show this help\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /cost           Show session cost summary\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /session        Show session info\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /clear          Clear screen\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /retry          Retry last message\n" ++ Color.reset);
+    printStr(Color.gray ++ "    exit, quit      Exit LCC\n" ++ Color.reset);
+    printStr("\n" ++ Color.gray ++ "  Input: type message, press Enter on empty line to send.\n" ++ Color.reset);
+    printStr(Color.gray ++ "  Ctrl+C once to interrupt, twice to quit.\n" ++ Color.reset);
+}
+
 /// Read multiline input. Empty line sends. Returns null on EOF.
+/// Uses buffered reads for better performance.
 pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
     const stdin = getStdin();
     var lines: std.ArrayList(u8) = .empty;
+
+    // Use a read buffer to reduce syscalls
+    var read_buf: [256]u8 = undefined;
+    var read_pos: usize = 0;
+    var read_len: usize = 0;
 
     while (true) {
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(alloc);
 
         while (true) {
-            var byte: [1]u8 = undefined;
-            const n = stdin.read(&byte) catch |err| {
-                if (err == error.BrokenPipe) return null;
-                return err;
-            };
-            if (n == 0) {
-                if (lines.items.len > 0) return try lines.toOwnedSlice(alloc);
-                return null;
+            // Read from buffer, refill if empty
+            if (read_pos >= read_len) {
+                read_len = stdin.read(&read_buf) catch |err| {
+                    if (err == error.BrokenPipe) return null;
+                    return err;
+                };
+                read_pos = 0;
+                if (read_len == 0) {
+                    if (lines.items.len > 0) return try lines.toOwnedSlice(alloc);
+                    return null;
+                }
             }
-            if (byte[0] == '\n') break;
-            if (byte[0] == '\r') continue;
-            try line.append(alloc, byte[0]);
+
+            const byte = read_buf[read_pos];
+            read_pos += 1;
+
+            if (byte == '\n') break;
+            if (byte == '\r') continue;
+            try line.append(alloc, byte);
         }
 
         if (line.items.len == 0) {
@@ -171,4 +207,23 @@ pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
 
         printContinuation();
     }
+}
+
+/// Read piped input until EOF. Returns null on empty.
+pub fn readPipedInput(alloc: std.mem.Allocator) !?[]const u8 {
+    const stdin = getStdin();
+    var buf: std.ArrayList(u8) = .empty;
+
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = stdin.read(&read_buf) catch |err| {
+            if (err == error.BrokenPipe) break;
+            return err;
+        };
+        if (n == 0) break;
+        try buf.appendSlice(alloc, read_buf[0..n]);
+    }
+
+    if (buf.items.len == 0) return null;
+    return try buf.toOwnedSlice(alloc);
 }

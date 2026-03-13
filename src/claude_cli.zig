@@ -9,7 +9,15 @@ pub const Config = struct {
     resume_session_id: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     allowed_tools: ?[]const u8 = null,
+    disallowed_tools: ?[]const u8 = null,
     permission_mode: ?[]const u8 = null,
+    continue_session: bool = false,
+    effort: ?[]const u8 = null,
+    max_budget_usd: ?[]const u8 = null,
+    tools: ?[]const u8 = null,
+    add_dir: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    quiet: bool = false,
 };
 
 /// Events parsed from claude CLI stream-json output
@@ -17,6 +25,7 @@ pub const Event = union(enum) {
     init: InitData,
     content_delta: []const u8,
     tool_start: ToolStartData,
+    tool_result: ToolResultData,
     result: ResultData,
     unknown: void,
 };
@@ -28,6 +37,11 @@ pub const InitData = struct {
 
 pub const ToolStartData = struct {
     name: []const u8,
+};
+
+pub const ToolResultData = struct {
+    name: []const u8,
+    output: []const u8,
 };
 
 pub const ResultData = struct {
@@ -76,6 +90,9 @@ pub const Process = struct {
             try argv_list.append(parent_alloc, "--max-turns");
             try argv_list.append(parent_alloc, s);
         }
+        if (config.continue_session) {
+            try argv_list.append(parent_alloc, "--continue");
+        }
         if (config.resume_session_id) |sid| {
             try argv_list.append(parent_alloc, "--resume");
             try argv_list.append(parent_alloc, sid);
@@ -88,9 +105,33 @@ pub const Process = struct {
             try argv_list.append(parent_alloc, "--allowedTools");
             try argv_list.append(parent_alloc, at);
         }
+        if (config.disallowed_tools) |dt| {
+            try argv_list.append(parent_alloc, "--disallowed-tools");
+            try argv_list.append(parent_alloc, dt);
+        }
         if (config.permission_mode) |pm| {
             try argv_list.append(parent_alloc, "--permission-mode");
             try argv_list.append(parent_alloc, pm);
+        }
+        if (config.effort) |e| {
+            try argv_list.append(parent_alloc, "--effort");
+            try argv_list.append(parent_alloc, e);
+        }
+        if (config.max_budget_usd) |b| {
+            try argv_list.append(parent_alloc, "--max-budget-usd");
+            try argv_list.append(parent_alloc, b);
+        }
+        if (config.tools) |t| {
+            try argv_list.append(parent_alloc, "--tools");
+            try argv_list.append(parent_alloc, t);
+        }
+        if (config.add_dir) |d| {
+            try argv_list.append(parent_alloc, "--add-dir");
+            try argv_list.append(parent_alloc, d);
+        }
+        if (config.cwd) |c| {
+            try argv_list.append(parent_alloc, "--cwd");
+            try argv_list.append(parent_alloc, c);
         }
 
         // Initial prompt required by -p; use empty string since we send via stdin
@@ -130,19 +171,21 @@ pub const Process = struct {
         return self;
     }
 
-    /// Send a user message via stdin (NDJSON). Uses stack buffer + direct write.
+    /// Send a user message via stdin (NDJSON). Buffered write to minimize syscalls.
     pub fn sendMessage(self: *Process, content: []const u8) !void {
         if (!self.alive) return error.ProcessDead;
 
         const stdin = self.child.stdin orelse return error.ProcessDead;
 
-        // Write prefix
-        _ = stdin.write("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"") catch |err| {
-            self.alive = false;
-            return err;
-        };
+        // Use a stack buffer to batch the write
+        var buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+        const prefix = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"";
+        const suffix = "\"}}\n";
 
-        // Write content with JSON escaping (no heap allocation)
+        @memcpy(buf[0..prefix.len], prefix);
+        pos = prefix.len;
+
         for (content) |c| {
             const escaped: ?[]const u8 = switch (c) {
                 '"' => "\\\"",
@@ -153,20 +196,33 @@ pub const Process = struct {
                 else => null,
             };
             if (escaped) |esc| {
-                _ = stdin.write(esc) catch |err| {
-                    self.alive = false;
-                    return err;
-                };
+                if (pos + esc.len > buf.len - suffix.len) {
+                    // Flush buffer
+                    _ = stdin.write(buf[0..pos]) catch |err| {
+                        self.alive = false;
+                        return err;
+                    };
+                    pos = 0;
+                }
+                @memcpy(buf[pos..][0..esc.len], esc);
+                pos += esc.len;
             } else {
-                _ = stdin.write(&.{c}) catch |err| {
-                    self.alive = false;
-                    return err;
-                };
+                if (pos + 1 > buf.len - suffix.len) {
+                    _ = stdin.write(buf[0..pos]) catch |err| {
+                        self.alive = false;
+                        return err;
+                    };
+                    pos = 0;
+                }
+                buf[pos] = c;
+                pos += 1;
             }
         }
 
-        // Write suffix + newline
-        _ = stdin.write("\"}}\n") catch |err| {
+        @memcpy(buf[pos..][0..suffix.len], suffix);
+        pos += suffix.len;
+
+        _ = stdin.write(buf[0..pos]) catch |err| {
             self.alive = false;
             return err;
         };
@@ -211,7 +267,6 @@ pub const Process = struct {
             // Read more data
             var buf: [4096]u8 = undefined;
             const n = stdout.read(&buf) catch |err| {
-                // EINTR from signal - check if we should stop
                 if (err == error.Unexpected) return null;
                 self.alive = false;
                 return null;
@@ -226,7 +281,6 @@ pub const Process = struct {
     }
 
     /// Reset the per-turn arena, freeing all JSON parse/stringify memory.
-    /// Call after processing a complete turn (result event received).
     pub fn resetTurnArena(self: *Process) void {
         _ = self.arena.reset(.retain_capacity);
     }
@@ -236,11 +290,8 @@ pub const Process = struct {
         if (!self.alive) return;
         self.alive = false;
 
-        // Send SIGTERM
         const pid = self.child.id;
         std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-
-        // Wait for cleanup
         _ = self.child.wait() catch {};
     }
 
@@ -259,27 +310,23 @@ pub const Process = struct {
 
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
     // Fast path: content_block_delta is the most frequent event during streaming.
-    // Extract text directly with string search instead of full JSON parse.
     if (std.mem.indexOf(u8, line, "\"text_delta\"")) |_| {
         if (std.mem.indexOf(u8, line, "\"text\":\"")) |text_start| {
-            const start = text_start + 8; // length of "text":"
+            const start = text_start + 8;
             if (start < line.len) {
-                // Find closing quote (handle escaped quotes)
                 var i = start;
                 while (i < line.len) : (i += 1) {
                     if (line[i] == '\\') {
-                        i += 1; // skip escaped char
+                        i += 1;
                         continue;
                     }
                     if (line[i] == '"') break;
                 }
                 if (i <= line.len) {
                     const raw = line[start..i];
-                    // If no escapes, return directly (common case)
                     if (std.mem.indexOf(u8, raw, "\\") == null) {
                         return .{ .content_delta = raw };
                     }
-                    // Has escapes: fall through to full JSON parse
                 }
             }
         }
@@ -313,6 +360,10 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
                     .name = jh.getString(content_block, "name") orelse "unknown",
                 } };
             }
+        } else if (std.mem.eql(u8, inner_type, "content_block_stop")) {
+            // Tool result can appear in the content blocks
+            // We handle this via the result event
+            return .unknown;
         }
         return .unknown;
     } else if (std.mem.eql(u8, event_type, "result")) {
