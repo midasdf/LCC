@@ -1,43 +1,45 @@
 const std = @import("std");
 const terminal = @import("terminal.zig");
 const agent_mod = @import("agent.zig");
+const claude_cli = @import("claude_cli.zig");
 
 pub fn main() !void {
     const alloc = std.heap.smp_allocator;
 
-    // Parse args first (--help doesn't need API key)
+    // Parse args
     var args = std.process.args();
     _ = args.next(); // skip program name
 
-    var model: []const u8 = "claude-opus-4-6";
-    var max_tokens: u32 = 16384;
+    var config: claude_cli.Config = .{};
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--model") or std.mem.eql(u8, arg, "-m")) {
-            if (args.next()) |m| model = m;
-        } else if (std.mem.eql(u8, arg, "--max-tokens") or std.mem.eql(u8, arg, "-t")) {
+            config.model = args.next();
+        } else if (std.mem.eql(u8, arg, "--max-turns")) {
             if (args.next()) |t| {
-                max_tokens = std.fmt.parseInt(u32, t, 10) catch 16384;
+                config.max_turns = std.fmt.parseInt(u32, t, 10) catch null;
             }
+        } else if (std.mem.eql(u8, arg, "--allowed-tools")) {
+            config.allowed_tools = args.next();
+        } else if (std.mem.eql(u8, arg, "--permission-mode")) {
+            config.permission_mode = args.next();
+        } else if (std.mem.eql(u8, arg, "--system-prompt")) {
+            config.system_prompt = args.next();
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            printHelp(alloc);
+            printHelp();
             return;
         }
     }
 
-    // Get API key
-    const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse {
-        terminal.printError(alloc, "ANTHROPIC_API_KEY environment variable not set", .{});
-        return;
-    };
-
     // Print banner
-    terminal.print(alloc, terminal.Color.bold ++ terminal.Color.cyan ++ "LCC" ++ terminal.Color.reset ++ " - Lightweight Claude Code\n", .{});
-    terminal.print(alloc, terminal.Color.gray ++ "Model: {s} | Max tokens: {d}" ++ terminal.Color.reset ++ "\n", .{ model, max_tokens });
+    terminal.print(alloc, terminal.Color.bold ++ terminal.Color.cyan ++ "LCC" ++ terminal.Color.reset ++ " - Lightweight Claude Code Wrapper\n", .{});
+    if (config.model) |m| {
+        terminal.print(alloc, terminal.Color.gray ++ "Model: {s}" ++ terminal.Color.reset ++ "\n", .{m});
+    }
     terminal.print(alloc, terminal.Color.gray ++ "Type your message. Press Enter to send. Type 'exit' to quit." ++ terminal.Color.reset ++ "\n", .{});
 
     // Initialize agent
-    var agent = try agent_mod.Agent.init(alloc, api_key, model, max_tokens);
+    var agent = agent_mod.Agent.init(alloc, config);
 
     // REPL loop
     while (true) {
@@ -59,25 +61,31 @@ pub fn main() !void {
     }
 }
 
-fn printHelp(alloc: std.mem.Allocator) void {
+fn printHelp() void {
     terminal.printStr(
-        \\LCC - Lightweight Claude Code
+        \\LCC - Lightweight Claude Code Wrapper
+        \\
+        \\A thin Zig wrapper around the `claude` CLI for low-memory environments.
+        \\Requires `claude` CLI to be installed and authenticated.
         \\
         \\Usage: lcc [options]
         \\
         \\Options:
-        \\  -m, --model <name>      Model to use (default: claude-opus-4-6)
-        \\  -t, --max-tokens <n>    Max response tokens (default: 16384)
-        \\  -h, --help              Show this help
+        \\  -m, --model <name>          Model to use (passed to claude CLI)
+        \\  --max-turns <n>             Max agent turns per message
+        \\  --allowed-tools <tools>     Comma-separated list of allowed tools
+        \\  --permission-mode <mode>    Permission mode (default, plan, auto, etc.)
+        \\  --system-prompt <prompt>    Append to system prompt
+        \\  -h, --help                  Show this help
         \\
         \\Environment:
-        \\  ANTHROPIC_API_KEY       Required. Your Anthropic API key.
+        \\  Requires `claude` CLI authenticated via `claude auth` or MAX subscription.
         \\
         \\Examples:
-        \\  ANTHROPIC_API_KEY=sk-... lcc
-        \\  lcc --model claude-sonnet-4-6
-        \\  lcc --max-tokens 32768
+        \\  lcc
+        \\  lcc --model opus
+        \\  lcc --max-turns 5
+        \\  lcc --permission-mode auto
         \\
     );
-    _ = alloc;
 }
