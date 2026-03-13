@@ -52,7 +52,49 @@ pub fn printStreaming(text: []const u8) void {
     printStr(text);
 }
 
-/// Read a line of input from stdin.
+pub fn printCost(alloc: std.mem.Allocator, turn_cost: f64, duration_ms: i64, total_cost: f64) void {
+    print(alloc, "\n" ++ Color.gray ++ "[{d}ms | ${d:.4} turn | ${d:.4} session]" ++ Color.reset, .{ duration_ms, turn_cost, total_cost });
+}
+
+/// Read multiline input. Empty line sends. Returns null on EOF.
+pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
+    const stdin = getStdin();
+    var lines: std.ArrayList(u8) = .empty;
+
+    while (true) {
+        var line: std.ArrayList(u8) = .empty;
+        while (true) {
+            var byte: [1]u8 = undefined;
+            const n = stdin.read(&byte) catch |err| {
+                if (err == error.BrokenPipe) return null;
+                return err;
+            };
+            if (n == 0) {
+                // EOF
+                if (lines.items.len > 0) return try lines.toOwnedSlice(alloc);
+                return null;
+            }
+            if (byte[0] == '\n') break;
+            if (byte[0] == '\r') continue;
+            try line.append(alloc, byte[0]);
+        }
+
+        if (line.items.len == 0) {
+            // Empty line = send accumulated text
+            if (lines.items.len > 0) return try lines.toOwnedSlice(alloc);
+            return try alloc.dupe(u8, "");
+        }
+
+        // Append line
+        if (lines.items.len > 0) try lines.append(alloc, '\n');
+        try lines.appendSlice(alloc, line.items);
+
+        // Show continuation prompt
+        printStr(Color.dim ++ ". " ++ Color.reset);
+    }
+}
+
+/// Read a single line of input from stdin (kept for compatibility).
 pub fn readInput(alloc: std.mem.Allocator) !?[]const u8 {
     const stdin = getStdin();
     var line: std.ArrayList(u8) = .empty;
