@@ -74,8 +74,9 @@ pub fn printToolDone(name: []const u8) void {
     printStr(Color.reset ++ "\n");
 }
 
-/// Print the user input prompt
+/// Print the user input prompt with command hints
 pub fn printPrompt() void {
+    printStr("\n" ++ Color.dim ++ "  /help /cost /retry /clear | exit" ++ Color.reset);
     printStr("\n" ++ Color.bold ++ Color.green ++ " > " ++ Color.reset);
 }
 
