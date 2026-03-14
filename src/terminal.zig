@@ -72,16 +72,16 @@ pub fn printSpinnerFrame(frame: usize) void {
     printStr(" " ++ Color.dim ++ "thinking..." ++ Color.reset);
 }
 
-/// Print tool activity (persistent, not cleared)
+/// Print tool activity (single-line, overwrites in place)
 pub fn printToolStart(name: []const u8) void {
-    printStr(Color.cyan ++ "  ▸ " ++ Color.bold);
+    printStr(CLEAR_LINE ++ Color.cyan ++ "  ▸ " ++ Color.bold);
     printStr(name);
-    printStr(Color.reset ++ Color.gray ++ " ..." ++ Color.reset ++ "\n");
+    printStr(Color.reset ++ Color.gray ++ " ..." ++ Color.reset);
 }
 
-/// Print tool completion (persistent, not cleared)
+/// Print tool completion (finalize and move to next line)
 pub fn printToolDone(name: []const u8) void {
-    printStr(Color.green ++ "  ✓ " ++ Color.reset ++ Color.dim);
+    printStr(CLEAR_LINE ++ Color.green ++ "  ✓ " ++ Color.reset ++ Color.dim);
     printStr(name);
     printStr(Color.reset ++ "\n");
 }
