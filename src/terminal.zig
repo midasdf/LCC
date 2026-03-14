@@ -60,16 +60,28 @@ pub fn printSeparator() void {
     printStr(Color.dim ++ "─────────────────────────────────────────────────" ++ Color.reset ++ "\n");
 }
 
-/// Print tool activity
-pub fn printToolStart(name: []const u8) void {
-    printStr(CLEAR_LINE ++ Color.cyan ++ "  > " ++ Color.bold);
-    printStr(name);
-    printStr(Color.reset ++ Color.gray ++ " ..." ++ Color.reset);
+/// Spinner frames for animated waiting indicator
+pub const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+/// Show animated spinner frame (overwrites current line)
+pub fn printSpinnerFrame(frame: usize) void {
+    const f = spinner_frames[frame % spinner_frames.len];
+    printStr(CLEAR_LINE ++ Color.cyan);
+    printStr("  ");
+    printStr(f);
+    printStr(" " ++ Color.dim ++ "thinking..." ++ Color.reset);
 }
 
-/// Print tool completion
+/// Print tool activity (persistent, not cleared)
+pub fn printToolStart(name: []const u8) void {
+    printStr(Color.cyan ++ "  ▸ " ++ Color.bold);
+    printStr(name);
+    printStr(Color.reset ++ Color.gray ++ " ..." ++ Color.reset ++ "\n");
+}
+
+/// Print tool completion (persistent, not cleared)
 pub fn printToolDone(name: []const u8) void {
-    printStr(CLEAR_LINE ++ Color.green ++ "  > " ++ Color.reset ++ Color.dim);
+    printStr(Color.green ++ "  ✓ " ++ Color.reset ++ Color.dim);
     printStr(name);
     printStr(Color.reset ++ "\n");
 }
@@ -105,7 +117,7 @@ pub fn clearScreen() void {
     printStr(CLEAR_SCREEN);
 }
 
-/// Show waiting indicator
+/// Show waiting indicator (static, used as fallback for non-interactive)
 pub fn printWaiting() void {
     printStr(Color.dim ++ "  thinking..." ++ Color.reset);
 }

@@ -11,6 +11,7 @@ pub const Agent = struct {
     total_cost_usd: f64,
     total_duration_ms: i64,
     last_message: ?[]const u8,
+    got_init: bool,
 
     pub fn init(alloc: std.mem.Allocator, config: claude_cli.Config, interrupted: *std.atomic.Value(bool)) Agent {
         return .{
@@ -22,6 +23,7 @@ pub const Agent = struct {
             .total_cost_usd = 0,
             .total_duration_ms = 0,
             .last_message = null,
+            .got_init = false,
         };
     }
 
@@ -29,15 +31,16 @@ pub const Agent = struct {
     pub fn ensureProcess(self: *Agent) !void {
         if (self.process != null and self.process.?.alive) return;
 
+        // Reset init flag when starting a new process
+        self.got_init = false;
+
         var config = self.config;
         if (self.session_id) |sid| {
             config.resume_session_id = sid;
-            // Don't use --continue when we already have a session to resume
             config.continue_session = false;
         }
 
         self.process = claude_cli.Process.start(self.alloc, config) catch |err| {
-            // Provide helpful error messages
             switch (err) {
                 error.FileNotFound => {
                     terminal.printError("claude CLI not found. Install it: npm install -g @anthropic-ai/claude-code", .{});
@@ -96,10 +99,13 @@ pub const Agent = struct {
             return;
         };
 
-        terminal.printWaiting();
-
         var got_first_content = false;
         var current_tool: ?[]const u8 = null;
+        var spinner_frame: usize = 0;
+        var spinner_active = true;
+
+        // Show initial spinner
+        terminal.printSpinnerFrame(0);
 
         while (true) {
             if (self.interrupted.load(.acquire)) {
@@ -111,76 +117,104 @@ pub const Agent = struct {
                 return;
             }
 
-            const event = proc.readEvent() catch {
-                terminal.clearSpinner();
-                if (current_tool) |tn| self.alloc.free(tn);
-                self.process = null;
-                return;
-            } orelse {
-                terminal.clearSpinner();
-                if (current_tool) |tn| self.alloc.free(tn);
-                self.process = null;
-                terminal.printStr(terminal.Color.yellow ++ "\n  [process ended unexpectedly]" ++ terminal.Color.reset ++ "\n");
-                terminal.printStr(terminal.Color.gray ++ "  Will restart on next message." ++ terminal.Color.reset ++ "\n");
-                return;
-            };
+            // Poll with 100ms timeout for spinner animation
+            const read_result = proc.readEventTimeout(100);
 
-            switch (event) {
-                .content_delta => |text| {
-                    if (!got_first_content) {
-                        got_first_content = true;
-                        terminal.clearSpinner();
-                        if (current_tool) |tn| {
-                            terminal.printToolDone(tn);
-                            self.alloc.free(tn);
-                            current_tool = null;
-                        }
-                        terminal.printResponseHeader();
+            switch (read_result) {
+                .timeout => {
+                    // Update spinner animation if still waiting for content
+                    if (spinner_active and !got_first_content and current_tool == null) {
+                        spinner_frame += 1;
+                        terminal.printSpinnerFrame(spinner_frame);
                     }
-                    terminal.printStreaming(text);
+                    continue;
                 },
-                .tool_start => |data| {
-                    if (!got_first_content) {
-                        terminal.clearSpinner();
-                    }
-                    if (current_tool) |tn| {
-                        terminal.printToolDone(tn);
-                        self.alloc.free(tn);
-                    }
-                    current_tool = self.alloc.dupe(u8, data.name) catch null;
-                    got_first_content = false;
-                    terminal.printToolStart(data.name);
-                },
-                .tool_result => {
-                    // tool_result events are handled implicitly via tool_start/done flow
-                },
-                .init => |data| {
-                    self.saveSessionId(data.session_id);
-                    terminal.printSessionInfo(data.session_id, data.model);
-                },
-                .result => |data| {
-                    if (current_tool) |tn| {
-                        terminal.clearSpinner();
-                        terminal.printToolDone(tn);
-                        self.alloc.free(tn);
-                    }
-
-                    self.saveSessionId(data.session_id);
-                    self.total_cost_usd += data.cost_usd;
-                    self.total_duration_ms += data.duration_ms;
-
-                    if (data.is_error) {
-                        terminal.printError("{s}", .{data.result_text});
-                    }
-
-                    terminal.printCost(data.cost_usd, data.duration_ms, self.total_cost_usd);
-
-                    // Reset turn arena - frees all JSON parse memory from this turn
-                    proc.resetTurnArena();
-
+                .eof => {
+                    terminal.clearSpinner();
+                    if (current_tool) |tn| self.alloc.free(tn);
+                    self.process = null;
+                    terminal.printStr(terminal.Color.yellow ++ "\n  [process ended unexpectedly]" ++ terminal.Color.reset ++ "\n");
+                    terminal.printStr(terminal.Color.gray ++ "  Will restart on next message." ++ terminal.Color.reset ++ "\n");
                     return;
                 },
-                .unknown => {},
+                .event => |event| {
+                    switch (event) {
+                        .content_delta => |text| {
+                            if (!got_first_content) {
+                                got_first_content = true;
+                                spinner_active = false;
+                                terminal.clearSpinner();
+                                if (current_tool) |tn| {
+                                    terminal.printToolDone(tn);
+                                    self.alloc.free(tn);
+                                    current_tool = null;
+                                }
+                                terminal.printResponseHeader();
+                            }
+                            terminal.printStreaming(text);
+                        },
+                        .tool_start => |data| {
+                            if (spinner_active) {
+                                terminal.clearSpinner();
+                                spinner_active = false;
+                            }
+                            if (current_tool) |tn| {
+                                terminal.printToolDone(tn);
+                                self.alloc.free(tn);
+                            }
+                            current_tool = self.alloc.dupe(u8, data.name) catch null;
+                            got_first_content = false;
+                            terminal.printToolStart(data.name);
+                        },
+                        .tool_result => {
+                            // tool_result events handled via tool_start/done flow
+                        },
+                        .init => |data| {
+                            // Only show session info on first init event
+                            // Clear spinner before showing session info
+                            if (spinner_active) {
+                                terminal.clearSpinner();
+                                spinner_active = false;
+                            }
+                            if (!self.got_init) {
+                                self.got_init = true;
+                                self.saveSessionId(data.session_id);
+                                if (data.model.len > 0) {
+                                    terminal.printSessionInfo(data.session_id, data.model);
+                                }
+                            } else {
+                                // Still save session_id for subsequent inits
+                                self.saveSessionId(data.session_id);
+                            }
+                        },
+                        .result => |data| {
+                            if (spinner_active) {
+                                terminal.clearSpinner();
+                                spinner_active = false;
+                            }
+                            if (current_tool) |tn| {
+                                terminal.printToolDone(tn);
+                                self.alloc.free(tn);
+                            }
+
+                            self.saveSessionId(data.session_id);
+                            self.total_cost_usd += data.cost_usd;
+                            self.total_duration_ms += data.duration_ms;
+
+                            if (data.is_error) {
+                                terminal.printError("{s}", .{data.result_text});
+                            }
+
+                            terminal.printCost(data.cost_usd, data.duration_ms, self.total_cost_usd);
+
+                            // Reset turn arena
+                            proc.resetTurnArena();
+
+                            return;
+                        },
+                        .unknown => {},
+                    }
+                },
             }
         }
     }

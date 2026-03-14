@@ -231,52 +231,88 @@ pub const Process = struct {
     /// Read the next event from stdout. Returns null on EOF (process died).
     /// Returned event data is valid until the next call to resetTurnArena().
     pub fn readEvent(self: *Process) !?Event {
-        if (!self.alive) return null;
+        return self.readEventTimeout(-1);
+    }
 
-        const stdout = self.child.stdout orelse return null;
+    /// Read the next event with a timeout in milliseconds.
+    /// Returns .timeout if no data within the timeout period.
+    /// Returns null on EOF. Negative timeout means block forever.
+    pub const ReadResult = union(enum) {
+        event: Event,
+        timeout: void,
+        eof: void,
+    };
+
+    pub fn readEventTimeout(self: *Process, timeout_ms: i32) ReadResult {
+        if (!self.alive) return .eof;
+
+        const stdout = self.child.stdout orelse return .eof;
         const alloc = self.turnAlloc();
 
+        // Check if we already have a complete line in the buffer
+        if (self.tryParseLine(alloc)) |event| {
+            return .{ .event = event };
+        }
+
+        // Need more data - use poll if timeout requested
+        const fd = stdout.handle;
+        var poll_fds = [1]std.posix.pollfd{
+            .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+
+        const poll_result = std.posix.poll(&poll_fds, timeout_ms) catch 0;
+        if (poll_result == 0) {
+            return .timeout;
+        }
+
+        // Data available, read it
+        var buf: [4096]u8 = undefined;
+        const n = stdout.read(&buf) catch |err| {
+            if (err == error.Unexpected) return .eof;
+            self.alive = false;
+            return .eof;
+        };
+        if (n == 0) {
+            self.alive = false;
+            return .eof;
+        }
+
+        self.line_buf.appendSlice(self.parent_alloc, buf[0..n]) catch return .eof;
+
+        // Try to parse a line from the updated buffer
+        if (self.tryParseLine(alloc)) |event| {
+            return .{ .event = event };
+        }
+
+        // Got data but no complete line yet
+        return .timeout;
+    }
+
+    /// Try to extract and parse one complete line from line_buf
+    fn tryParseLine(self: *Process, alloc: std.mem.Allocator) ?Event {
         while (true) {
-            // Check if we already have a complete line in the buffer
-            if (std.mem.indexOf(u8, self.line_buf.items, "\n")) |nl_pos| {
-                const line = self.line_buf.items[0..nl_pos];
+            const nl_pos = std.mem.indexOf(u8, self.line_buf.items, "\n") orelse return null;
+            const line = self.line_buf.items[0..nl_pos];
 
-                if (line.len > 0) {
-                    // Parse before modifying line_buf (line points into it)
-                    const event = parseLine(alloc, line);
+            if (line.len > 0) {
+                const event = parseLine(alloc, line);
 
-                    // Remove processed line from buffer
-                    const remaining = self.line_buf.items.len - nl_pos - 1;
-                    if (remaining > 0) {
-                        std.mem.copyForwards(u8, self.line_buf.items[0..remaining], self.line_buf.items[nl_pos + 1 ..]);
-                    }
-                    self.line_buf.items.len = remaining;
-
-                    return event;
-                }
-
-                // Empty line, skip it
+                // Remove processed line from buffer
                 const remaining = self.line_buf.items.len - nl_pos - 1;
                 if (remaining > 0) {
                     std.mem.copyForwards(u8, self.line_buf.items[0..remaining], self.line_buf.items[nl_pos + 1 ..]);
                 }
                 self.line_buf.items.len = remaining;
-                continue;
+
+                return event;
             }
 
-            // Read more data
-            var buf: [4096]u8 = undefined;
-            const n = stdout.read(&buf) catch |err| {
-                if (err == error.Unexpected) return null;
-                self.alive = false;
-                return null;
-            };
-            if (n == 0) {
-                self.alive = false;
-                return null;
+            // Empty line, skip it
+            const remaining = self.line_buf.items.len - nl_pos - 1;
+            if (remaining > 0) {
+                std.mem.copyForwards(u8, self.line_buf.items[0..remaining], self.line_buf.items[nl_pos + 1 ..]);
             }
-
-            try self.line_buf.appendSlice(self.parent_alloc, buf[0..n]);
+            self.line_buf.items.len = remaining;
         }
     }
 
@@ -361,8 +397,6 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
                 } };
             }
         } else if (std.mem.eql(u8, inner_type, "content_block_stop")) {
-            // Tool result can appear in the content blocks
-            // We handle this via the result event
             return .unknown;
         }
         return .unknown;
