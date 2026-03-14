@@ -122,9 +122,12 @@ pub const Agent = struct {
 
             switch (read_result) {
                 .timeout => {
-                    // Update spinner animation if still waiting for content
-                    if (spinner_active and !got_first_content and current_tool == null) {
-                        spinner_frame += 1;
+                    spinner_frame += 1;
+                    if (current_tool) |tn| {
+                        // Animate tool spinner
+                        terminal.printToolSpinnerFrame(tn, spinner_frame);
+                    } else if (spinner_active and !got_first_content) {
+                        // Animate thinking spinner
                         terminal.printSpinnerFrame(spinner_frame);
                     }
                     continue;
@@ -154,17 +157,14 @@ pub const Agent = struct {
                             terminal.printStreaming(text);
                         },
                         .tool_start => |data| {
-                            if (spinner_active) {
-                                terminal.clearSpinner();
-                                spinner_active = false;
-                            }
+                            spinner_active = false;
                             if (current_tool) |tn| {
-                                terminal.printToolDone(tn);
                                 self.alloc.free(tn);
                             }
                             current_tool = self.alloc.dupe(u8, data.name) catch null;
                             got_first_content = false;
-                            terminal.printToolStart(data.name);
+                            spinner_frame = 0;
+                            terminal.printToolSpinnerFrame(data.name, 0);
                         },
                         .tool_result => {
                             // tool_result events handled via tool_start/done flow

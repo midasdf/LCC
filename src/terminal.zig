@@ -72,11 +72,14 @@ pub fn printSpinnerFrame(frame: usize) void {
     printStr(" " ++ Color.dim ++ "thinking..." ++ Color.reset);
 }
 
-/// Print tool activity (single-line, overwrites in place)
-pub fn printToolStart(name: []const u8) void {
-    printStr(CLEAR_LINE ++ Color.cyan ++ "  ▸ " ++ Color.bold);
+/// Show animated tool spinner frame (overwrites current line)
+pub fn printToolSpinnerFrame(name: []const u8, frame: usize) void {
+    const f = spinner_frames[frame % spinner_frames.len];
+    printStr(CLEAR_LINE ++ Color.cyan ++ "  ");
+    printStr(f);
+    printStr(" " ++ Color.bold);
     printStr(name);
-    printStr(Color.reset ++ Color.gray ++ " ..." ++ Color.reset);
+    printStr(Color.reset);
 }
 
 /// Clear tool display (tool finished, remove from screen)
