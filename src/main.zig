@@ -62,8 +62,14 @@ pub fn main() !void {
             config.add_dir = args.next();
         } else if (std.mem.eql(u8, arg, "--cwd")) {
             config.cwd = args.next();
+        } else if (std.mem.eql(u8, arg, "--recycle-turns")) {
+            if (args.next()) |t| {
+                config.recycle_turns = std.fmt.parseInt(u32, t, 10) catch null;
+            }
         } else if (std.mem.eql(u8, arg, "--quiet") or std.mem.eql(u8, arg, "-q")) {
             config.quiet = true;
+        } else if (std.mem.eql(u8, arg, "--debug")) {
+            config.debug = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
             return;
@@ -151,6 +157,13 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, trimmed, "/clear")) {
             terminal.clearScreen();
             continue;
+        } else if (std.mem.eql(u8, trimmed, "/recycle")) {
+            if (agent.session_id != null) {
+                agent.recycleProcess();
+            } else {
+                terminal.printStr(terminal.Color.gray ++ "  No active session to recycle." ++ terminal.Color.reset ++ "\n");
+            }
+            continue;
         } else if (std.mem.eql(u8, trimmed, "/retry")) {
             if (agent.getLastMessage()) |last| {
                 terminal.printStr(terminal.Color.gray ++ "  Retrying last message..." ++ terminal.Color.reset ++ "\n");
@@ -196,6 +209,8 @@ fn printHelp() void {
         \\  --cwd <dir>                 Working directory for file operations
         \\  --permission-mode <mode>    Permission mode (default, plan, auto, etc.)
         \\  --system-prompt <prompt>    Append to system prompt
+        \\  --recycle-turns <n>         Restart claude process every N turns (default: 10)
+        \\  --debug                     Show claude CLI stderr output
         \\  -h, --help                  Show this help
         \\
         \\REPL Commands:
@@ -204,6 +219,7 @@ fn printHelp() void {
         \\  /session     Show session info
         \\  /clear       Clear screen
         \\  /retry       Retry last message
+        \\  /recycle     Restart claude process (frees memory)
         \\  exit, quit   Exit LCC
         \\
         \\Pipe Mode:

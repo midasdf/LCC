@@ -37,7 +37,7 @@ pub fn isInteractive() bool {
 
 /// Print formatted text to stdout using a stack buffer (no heap allocation)
 pub fn print(comptime fmt: []const u8, args: anytype) void {
-    var buf: [1024]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch {
         return;
     };
@@ -89,7 +89,7 @@ pub fn printToolDone(_: []const u8) void {
 
 /// Print the user input prompt with command hints
 pub fn printPrompt() void {
-    printStr("\n" ++ Color.dim ++ "  /help /cost /retry /clear | exit" ++ Color.reset);
+    printStr("\n" ++ Color.dim ++ "  /help /cost /retry /recycle /clear | exit" ++ Color.reset);
     printStr("\n" ++ Color.bold ++ Color.green ++ " > " ++ Color.reset);
 }
 
@@ -169,6 +169,7 @@ pub fn printReplHelp() void {
     printStr(Color.gray ++ "    /session        Show session info\n" ++ Color.reset);
     printStr(Color.gray ++ "    /clear          Clear screen\n" ++ Color.reset);
     printStr(Color.gray ++ "    /retry          Retry last message\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /recycle        Restart claude process (frees memory)\n" ++ Color.reset);
     printStr(Color.gray ++ "    exit, quit      Exit LCC\n" ++ Color.reset);
     printStr("\n" ++ Color.gray ++ "  Input: type message, press Enter on empty line to send.\n" ++ Color.reset);
     printStr(Color.gray ++ "  Ctrl+C once to interrupt, twice to quit.\n" ++ Color.reset);

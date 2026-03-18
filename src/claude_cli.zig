@@ -18,6 +18,8 @@ pub const Config = struct {
     add_dir: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     quiet: bool = false,
+    recycle_turns: ?u32 = null,
+    debug: bool = false,
 };
 
 /// Events parsed from claude CLI stream-json output
@@ -141,7 +143,8 @@ pub const Process = struct {
 
         // Build env without CLAUDECODE to allow nested invocation
         var env_map = std.process.EnvMap.init(parent_alloc);
-        const env_vars = std.process.getEnvMap(parent_alloc) catch return error.EnvError;
+        var env_vars = std.process.getEnvMap(parent_alloc) catch return error.EnvError;
+        defer env_vars.deinit();
         var env_it = env_vars.iterator();
         while (env_it.next()) |entry| {
             if (std.mem.eql(u8, entry.key_ptr.*, "CLAUDECODE")) continue;
@@ -163,7 +166,7 @@ pub const Process = struct {
         self.child.env_map = &self.env_map;
         self.child.stdin_behavior = .Pipe;
         self.child.stdout_behavior = .Pipe;
-        self.child.stderr_behavior = .Pipe;
+        self.child.stderr_behavior = if (config.debug) .Inherit else .Ignore;
 
         try self.child.spawn();
         self.alive = true;
@@ -226,12 +229,6 @@ pub const Process = struct {
             self.alive = false;
             return err;
         };
-    }
-
-    /// Read the next event from stdout. Returns null on EOF (process died).
-    /// Returned event data is valid until the next call to resetTurnArena().
-    pub fn readEvent(self: *Process) !?Event {
-        return self.readEventTimeout(-1);
     }
 
     /// Read the next event with a timeout in milliseconds.
@@ -353,7 +350,7 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
                 var i = start;
                 while (i < line.len) : (i += 1) {
                     if (line[i] == '\\') {
-                        i += 1;
+                        if (i + 1 < line.len) i += 1;
                         continue;
                     }
                     if (line[i] == '"') break;
