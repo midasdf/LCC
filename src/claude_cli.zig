@@ -114,6 +114,7 @@ pub const Process = struct {
     session_id: []const u8,
     line_buf: std.ArrayList(u8),
     env_map: std.process.EnvMap,
+    argv: []const []const u8,
     alive: bool,
 
     /// Get the per-turn allocator (freed on resetTurnArena)
@@ -251,6 +252,7 @@ pub const Process = struct {
             .session_id = "",
             .line_buf = .empty,
             .env_map = env_map,
+            .argv = argv,
             .alive = false,
         };
 
@@ -288,11 +290,12 @@ pub const Process = struct {
                 '\n' => "\\n",
                 '\r' => "\\r",
                 '\t' => "\\t",
+                0x08 => "\\b",
+                0x0C => "\\f",
                 else => null,
             };
             if (escaped) |esc| {
                 if (pos + esc.len > buf.len - suffix.len) {
-                    // Flush buffer
                     _ = stdin.write(buf[0..pos]) catch |err| {
                         self.alive = false;
                         return err;
@@ -301,6 +304,19 @@ pub const Process = struct {
                 }
                 @memcpy(buf[pos..][0..esc.len], esc);
                 pos += esc.len;
+            } else if (c < 0x20) {
+                // JSON requires all control chars U+0000-U+001F to be escaped
+                const hex = "0123456789abcdef";
+                const esc = [6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] };
+                if (pos + 6 > buf.len - suffix.len) {
+                    _ = stdin.write(buf[0..pos]) catch |err| {
+                        self.alive = false;
+                        return err;
+                    };
+                    pos = 0;
+                }
+                @memcpy(buf[pos..][0..6], &esc);
+                pos += 6;
             } else {
                 if (pos + 1 > buf.len - suffix.len) {
                     _ = stdin.write(buf[0..pos]) catch |err| {
@@ -429,6 +445,8 @@ pub const Process = struct {
     pub fn deinit(self: *Process) void {
         self.kill();
         self.line_buf.deinit(self.parent_alloc);
+        self.env_map.deinit();
+        self.parent_alloc.free(self.argv);
         self.arena.deinit();
     }
 };
@@ -450,7 +468,9 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
                 if (i <= line.len) {
                     const raw = line[start..i];
                     if (std.mem.indexOf(u8, raw, "\\") == null) {
-                        return .{ .content_delta = raw };
+                        // Must dupe: line points into line_buf which gets shifted in tryParseLine
+                        const duped = alloc.dupe(u8, raw) catch return .unknown;
+                        return .{ .content_delta = duped };
                     }
                 }
             }

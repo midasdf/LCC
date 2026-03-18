@@ -10,7 +10,8 @@ const version = "0.3.0";
 // Module-level globals for signal handler (must be accessible from C callconv)
 var g_interrupted: *std.atomic.Value(bool) = undefined;
 var g_sigint_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-var g_agent: ?*agent_mod.Agent = null;
+// Atomic PID for signal-safe child process termination (avoids data race on Agent struct)
+var g_child_pid: std.atomic.Value(i32) = std.atomic.Value(i32).init(0);
 
 fn sigintHandler(_: c_int) callconv(.c) void {
     const count = g_sigint_count.fetchAdd(1, .monotonic);
@@ -19,11 +20,10 @@ fn sigintHandler(_: c_int) callconv(.c) void {
     }
     g_interrupted.store(true, .release);
 
-    if (g_agent) |agent| {
-        const pid = agent.getChildPid();
-        if (pid > 0) {
-            std.posix.kill(pid, std.posix.SIG.TERM) catch {};
-        }
+    // Kill child process using atomic PID (signal-safe)
+    const pid = g_child_pid.load(.acquire);
+    if (pid > 0) {
+        std.posix.kill(pid, std.posix.SIG.TERM) catch {};
     }
 }
 
@@ -237,8 +237,7 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
 
     // Initialize agent
-    var agent = agent_mod.Agent.init(alloc, config, &interrupted);
-    g_agent = &agent;
+    var agent = agent_mod.Agent.init(alloc, config, &interrupted, &g_child_pid);
 
     // Load input history
     var history_path_buf: [256]u8 = undefined;

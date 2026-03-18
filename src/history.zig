@@ -16,9 +16,12 @@ pub const History = struct {
         };
     }
 
-    /// Add an entry to history
+    /// Add an entry to history (multi-line entries are stored but
+    /// only single-line entries are persisted to disk)
     pub fn add(self: *History, entry: []const u8) void {
         if (entry.len == 0) return;
+        // Skip entries that are too long for practical history use
+        if (entry.len > 4096) return;
         // Don't add duplicates of the last entry
         if (self.entries.items.len > 0) {
             if (std.mem.eql(u8, self.entries.items[self.entries.items.len - 1], entry)) {
@@ -97,6 +100,8 @@ pub const History = struct {
         const file = std.fs.createFileAbsolute(path, .{}) catch return;
         defer file.close();
         for (self.entries.items) |entry| {
+            // Skip multi-line entries — they can't survive newline-delimited format
+            if (std.mem.indexOf(u8, entry, "\n") != null) continue;
             _ = file.write(entry) catch return;
             _ = file.write("\n") catch return;
         }

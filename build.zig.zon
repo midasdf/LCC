@@ -1,6 +1,6 @@
 .{
     .name = .lcc,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x24e7e3d0616a10b3,
     .minimum_zig_version = "0.15.2",
     .paths = .{

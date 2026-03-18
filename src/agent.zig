@@ -12,6 +12,7 @@ pub const Agent = struct {
     process: ?claude_cli.Process,
     session_id: ?[]const u8,
     interrupted: *std.atomic.Value(bool),
+    child_pid: *std.atomic.Value(i32),
     total_cost_usd: f64,
     total_duration_ms: i64,
     last_message: ?[]const u8,
@@ -26,13 +27,14 @@ pub const Agent = struct {
     tool_input_buf: std.ArrayList(u8),
     model_owned: bool, // whether config.model was alloc'd by us
 
-    pub fn init(alloc: std.mem.Allocator, config: claude_cli.Config, interrupted: *std.atomic.Value(bool)) Agent {
+    pub fn init(alloc: std.mem.Allocator, config: claude_cli.Config, interrupted: *std.atomic.Value(bool), child_pid: *std.atomic.Value(i32)) Agent {
         return .{
             .alloc = alloc,
             .config = config,
             .process = null,
             .session_id = null,
             .interrupted = interrupted,
+            .child_pid = child_pid,
             .total_cost_usd = 0,
             .total_duration_ms = 0,
             .last_message = null,
@@ -75,6 +77,10 @@ pub const Agent = struct {
             }
             return err;
         };
+        // Update atomic PID for signal handler
+        if (self.process) |*p| {
+            self.child_pid.store(p.child.id, .release);
+        }
     }
 
     /// Save session_id to long-lived allocator (survives arena reset)
@@ -132,6 +138,7 @@ pub const Agent = struct {
 
         proc.sendMessage(user_input) catch |err| {
             terminal.printError("Failed to send message: {s}", .{@errorName(err)});
+            self.child_pid.store(0, .release);
             self.process = null;
             return;
         };
@@ -152,6 +159,7 @@ pub const Agent = struct {
             if (self.interrupted.load(.acquire)) {
                 terminal.clearSpinner();
                 if (current_tool) |tn| self.alloc.free(tn);
+                self.child_pid.store(0, .release);
                 proc.kill();
                 self.process = null;
                 terminal.printStr(terminal.Color.yellow ++ "\n  [interrupted]" ++ terminal.Color.reset ++ "\n");
@@ -177,6 +185,7 @@ pub const Agent = struct {
                 .eof => {
                     terminal.clearSpinner();
                     if (current_tool) |tn| self.alloc.free(tn);
+                    self.child_pid.store(0, .release);
                     self.process = null;
                     terminal.printStr(terminal.Color.yellow ++ "\n  [process ended unexpectedly]" ++ terminal.Color.reset ++ "\n");
                     terminal.printStr(terminal.Color.gray ++ "  Will restart on next message." ++ terminal.Color.reset ++ "\n");
@@ -317,14 +326,6 @@ pub const Agent = struct {
         }
     }
 
-    /// Get PID of the running claude process (for signal handler)
-    pub fn getChildPid(self: *const Agent) std.posix.pid_t {
-        if (self.process) |*proc| {
-            return proc.getPid();
-        }
-        return 0;
-    }
-
     /// Print cost info for /cost command
     pub fn printCostSummary(self: *const Agent) void {
         if (self.total_cost_usd > 0 or self.total_duration_ms > 0) {
@@ -338,6 +339,7 @@ pub const Agent = struct {
 
     /// Recycle the claude CLI process to free Node.js memory.
     pub fn recycleProcess(self: *Agent) void {
+        self.child_pid.store(0, .release);
         if (self.process) |*proc| {
             proc.deinit();
             self.process = null;
@@ -422,9 +424,14 @@ pub const Agent = struct {
 
     /// Graceful shutdown
     pub fn shutdown(self: *Agent) void {
+        self.child_pid.store(0, .release);
         if (self.process) |*proc| {
             proc.deinit();
             self.process = null;
+        }
+        if (self.session_id) |sid| {
+            if (sid.len > 0) self.alloc.free(sid);
+            self.session_id = null;
         }
         if (self.last_message) |lm| {
             self.alloc.free(lm);

@@ -114,7 +114,10 @@ pub const MarkdownRenderer = struct {
 
         // Bullet points: - or *
         if (line.len >= 2 and (line[0] == '-' or line[0] == '*') and line[1] == ' ') {
-            terminal.printStr(terminal.Color.cyan ++ "  " ++ terminal.Color.reset);
+            terminal.printStr(terminal.Color.cyan);
+            var bullet: [1]u8 = .{line[0]};
+            terminal.printStr(&bullet);
+            terminal.printStr(" " ++ terminal.Color.reset);
             renderInline(line[2..]);
             return;
         }
