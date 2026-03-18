@@ -3,8 +3,9 @@ const terminal = @import("terminal.zig");
 const agent_mod = @import("agent.zig");
 const claude_cli = @import("claude_cli.zig");
 const settings = @import("settings.zig");
+const history_mod = @import("history.zig");
 
-const version = "0.2.0";
+const version = "0.3.0";
 
 // Module-level globals for signal handler (must be accessible from C callconv)
 var g_interrupted: *std.atomic.Value(bool) = undefined;
@@ -14,12 +15,10 @@ var g_agent: ?*agent_mod.Agent = null;
 fn sigintHandler(_: c_int) callconv(.c) void {
     const count = g_sigint_count.fetchAdd(1, .monotonic);
     if (count >= 1) {
-        // Double Ctrl+C: force exit
         std.posix.exit(1);
     }
     g_interrupted.store(true, .release);
 
-    // Kill child process to unblock stdout read
     if (g_agent) |agent| {
         const pid = agent.getChildPid();
         if (pid > 0) {
@@ -31,7 +30,7 @@ fn sigintHandler(_: c_int) callconv(.c) void {
 pub fn main() !void {
     const alloc = std.heap.smp_allocator;
 
-    // Parse args — collect into slice first for index-based access (needed for peek/lookahead)
+    // Parse args — collect into slice for index-based access
     var raw_args = std.process.args();
     _ = raw_args.next(); // skip program name
 
@@ -43,12 +42,11 @@ pub fn main() !void {
 
     var config: claude_cli.Config = .{};
     var extra_args_list: std.ArrayList([]const u8) = .empty;
+    var add_dirs_list: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
 
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-
-        // Helper: consume next arg as value
         const next_val: ?[]const u8 = if (i + 1 < argv.len) argv[i + 1] else null;
 
         // --- Model & behavior ---
@@ -114,8 +112,10 @@ pub fn main() !void {
 
             // --- Directories & files ---
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
-            config.add_dir = next_val;
-            i += 1;
+            if (next_val) |d| {
+                try add_dirs_list.append(alloc, d);
+                i += 1;
+            }
         } else if (std.mem.eql(u8, arg, "--cwd")) {
             config.cwd = next_val;
             i += 1;
@@ -164,10 +164,9 @@ pub fn main() !void {
 
             // --- Worktree ---
         } else if (std.mem.eql(u8, arg, "--worktree") or std.mem.eql(u8, arg, "-w")) {
-            // Optional value: peek at next arg without consuming if it's a flag
             if (next_val) |next| {
                 if (std.mem.startsWith(u8, next, "-")) {
-                    config.worktree = ""; // auto-name
+                    config.worktree = "";
                 } else {
                     config.worktree = next;
                     i += 1;
@@ -182,6 +181,13 @@ pub fn main() !void {
                 config.recycle_turns = std.fmt.parseInt(u32, t, 10) catch null;
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--recycle-rss-mb")) {
+            if (next_val) |t| {
+                config.recycle_rss_mb = std.fmt.parseInt(u32, t, 10) catch null;
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--compact")) {
+            config.compact = true;
         } else if (std.mem.eql(u8, arg, "--quiet") or std.mem.eql(u8, arg, "-q")) {
             config.quiet = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -195,20 +201,21 @@ pub fn main() !void {
         } else if (std.mem.startsWith(u8, arg, "-")) {
             // Unknown flag: pass through to claude CLI
             try extra_args_list.append(alloc, arg);
-            // Peek: if next arg exists and doesn't look like a flag, treat as value
             if (next_val) |next| {
                 if (!std.mem.startsWith(u8, next, "-")) {
                     try extra_args_list.append(alloc, next);
                     i += 1;
                 }
-                // If next starts with -, don't consume it — loop will handle it
             }
         }
     }
 
-    // Store extra args if any
+    // Store accumulated lists
     if (extra_args_list.items.len > 0) {
         config.extra_args = try extra_args_list.toOwnedSlice(alloc);
+    }
+    if (add_dirs_list.items.len > 0) {
+        config.add_dirs = try add_dirs_list.toOwnedSlice(alloc);
     }
 
     // Apply preferredLanguage from ~/.claude/settings.json
@@ -233,9 +240,18 @@ pub fn main() !void {
     var agent = agent_mod.Agent.init(alloc, config, &interrupted);
     g_agent = &agent;
 
+    // Load input history
+    var history_path_buf: [256]u8 = undefined;
+    var history_path: ?[]const u8 = null;
+    if (std.posix.getenv("HOME")) |home| {
+        history_path = std.fmt.bufPrint(&history_path_buf, "{s}/.lcc_history", .{home}) catch null;
+    }
+    var hist = history_mod.History.init(alloc);
+    defer hist.deinit();
+    if (history_path) |hp| hist.load(hp);
+
     // Check if stdin is piped (non-interactive)
     if (!terminal.isInteractive()) {
-        // Pipe mode: read all stdin, send as single message
         const input = terminal.readPipedInput(alloc) catch |err| {
             terminal.printError("Input error: {s}", .{@errorName(err)});
             return;
@@ -262,13 +278,12 @@ pub fn main() !void {
 
     // REPL loop
     while (true) {
-        // Reset interrupt state for new turn
         interrupted.store(false, .release);
         g_sigint_count.store(0, .release);
 
         terminal.printPrompt();
 
-        const input = terminal.readMultilineInput(alloc) catch |err| {
+        const input = terminal.readMultilineInput(alloc, &hist) catch |err| {
             terminal.printError("Input error: {s}", .{@errorName(err)});
             continue;
         } orelse break; // EOF
@@ -292,6 +307,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, trimmed, "/clear")) {
             terminal.clearScreen();
             continue;
+        } else if (std.mem.eql(u8, trimmed, "/compact")) {
+            agent.toggleCompact();
+            continue;
         } else if (std.mem.eql(u8, trimmed, "/recycle")) {
             if (agent.session_id != null) {
                 agent.recycleProcess();
@@ -312,12 +330,62 @@ pub fn main() !void {
                 terminal.printStr(terminal.Color.gray ++ "  No previous message to retry." ++ terminal.Color.reset ++ "\n");
             }
             continue;
+        } else if (std.mem.startsWith(u8, trimmed, "/model")) {
+            // /model <name>
+            const rest = std.mem.trim(u8, trimmed[6..], " ");
+            if (rest.len > 0) {
+                agent.setModel(rest);
+            } else {
+                if (agent.config.model) |m| {
+                    terminal.print(terminal.Color.gray ++ "  Current model: {s}" ++ terminal.Color.reset ++ "\n", .{m});
+                } else {
+                    terminal.printStr(terminal.Color.gray ++ "  No model set (using default)." ++ terminal.Color.reset ++ "\n");
+                }
+                terminal.printStr(terminal.Color.gray ++ "  Usage: /model <name>  (e.g. /model opus)" ++ terminal.Color.reset ++ "\n");
+            }
+            continue;
+        } else if (std.mem.startsWith(u8, trimmed, "/save")) {
+            // /save [filename]
+            if (agent.getLastResponse()) |resp| {
+                const rest = std.mem.trim(u8, trimmed[5..], " ");
+                const filename = if (rest.len > 0) rest else "lcc-response.md";
+
+                // Resolve to absolute path
+                var cwd_buf: [512]u8 = undefined;
+                var path_buf: [1024]u8 = undefined;
+                const save_path = if (std.fs.path.isAbsolute(filename))
+                    filename
+                else blk: {
+                    const cwd = std.process.getCwd(&cwd_buf) catch {
+                        terminal.printError("Could not get cwd", .{});
+                        continue;
+                    };
+                    break :blk std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cwd, filename }) catch {
+                        terminal.printError("Path too long", .{});
+                        continue;
+                    };
+                };
+
+                terminal.writeFile(save_path, resp) catch |err| {
+                    terminal.printError("Failed to save: {s}", .{@errorName(err)});
+                    continue;
+                };
+                terminal.print(terminal.Color.green ++ "  Saved to: {s}" ++ terminal.Color.reset ++ "\n", .{save_path});
+            } else {
+                terminal.printStr(terminal.Color.gray ++ "  No response to save yet." ++ terminal.Color.reset ++ "\n");
+            }
+            continue;
         }
 
+        // Add to history and send
+        hist.add(trimmed);
         agent.processUserMessage(trimmed) catch |err| {
             terminal.printError("Error: {s}", .{@errorName(err)});
         };
     }
+
+    // Save history
+    if (history_path) |hp| hist.save(hp);
 
     agent.shutdown();
     terminal.printStr(terminal.Color.gray ++ "  Goodbye!" ++ terminal.Color.reset ++ "\n\n");
@@ -360,7 +428,7 @@ fn printHelp() void {
         \\  --disallowed-tools <tools>  Deny specific tools
         \\
         \\Directories & Files:
-        \\  --add-dir <dir>             Additional directory for tool access
+        \\  --add-dir <dir>             Additional directory (can be repeated)
         \\  --cwd <dir>                 Working directory for file operations
         \\  --file <spec>               File resource (format: file_id:path)
         \\
@@ -387,7 +455,9 @@ fn printHelp() void {
         \\  -w, --worktree [name]       Create git worktree for session
         \\
         \\LCC-specific:
-        \\  --recycle-turns <n>         Restart claude process every N turns (default: 10)
+        \\  --recycle-turns <n>         Restart process every N turns (default: 10)
+        \\  --recycle-rss-mb <mb>       Restart when RSS exceeds threshold (MB)
+        \\  --compact                   Hide tool execution details
         \\  --debug                     Show claude CLI stderr output
         \\  -q, --quiet                 Suppress startup banner
         \\  -v, --version               Show LCC version
@@ -396,34 +466,31 @@ fn printHelp() void {
         \\  Unknown flags are passed through to claude CLI directly.
         \\
         \\REPL Commands:
-        \\  /help, ?       Show REPL help
-        \\  /cost          Show session cost summary
-        \\  /session       Show session info (+ claude RSS memory)
-        \\  /clear         Clear screen
-        \\  /retry         Retry last message
-        \\  /recycle       Restart claude process (frees memory)
-        \\  /version       Show LCC version
-        \\  exit, quit     Exit LCC
+        \\  /help, ?            Show REPL help
+        \\  /cost               Show session cost summary
+        \\  /session            Show session info (+ RSS, compact status)
+        \\  /model <name>       Switch model (restarts process)
+        \\  /save [file]        Save last response to file
+        \\  /compact            Toggle compact mode (hide tool details)
+        \\  /clear              Clear screen
+        \\  /retry              Retry last message
+        \\  /recycle            Restart claude process (frees memory)
+        \\  /version            Show LCC version
+        \\  exit, quit          Exit LCC
+        \\
+        \\  Up/Down arrows browse input history (~/.lcc_history).
         \\
         \\Pipe Mode:
-        \\  Reads all stdin and sends as a single message when piped.
-        \\  Example: echo "explain this code" | lcc
-        \\  Example: cat file.py | lcc --system-prompt "review this code"
-        \\  Example: echo "fix bugs" | lcc --json-schema '{"type":"object"}'
-        \\
-        \\Environment:
-        \\  Requires `claude` CLI authenticated via `claude auth` or MAX subscription.
+        \\  echo "explain this code" | lcc
+        \\  cat file.py | lcc --system-prompt "review this code"
         \\
         \\Examples:
         \\  lcc                                    Interactive mode
         \\  lcc --model opus                       Use Opus model
         \\  lcc --continue                         Resume last session
-        \\  lcc -r abc123                          Resume specific session
-        \\  lcc -n "refactor"                      Named session
-        \\  lcc --agent reviewer                   Use specific agent
-        \\  lcc --mcp-config servers.json          With MCP servers
-        \\  lcc --effort max --recycle-turns 5     High effort, frequent recycle
-        \\  lcc --permission-mode auto             Auto-approve permissions
+        \\  lcc --add-dir ../lib --add-dir ../api  Multiple directories
+        \\  lcc --compact --recycle-rss-mb 512     Low-memory mode
+        \\  lcc --agent reviewer -n "code review"  Named agent session
         \\
     );
 }

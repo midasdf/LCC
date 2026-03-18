@@ -32,7 +32,7 @@ pub const Config = struct {
     disallowed_tools: ?[]const u8 = null,
 
     // --- Directories & files ---
-    add_dir: ?[]const u8 = null,
+    add_dirs: ?[]const []const u8 = null, // multiple --add-dir support
     cwd: ?[]const u8 = null,
     file: ?[]const u8 = null,
 
@@ -64,6 +64,8 @@ pub const Config = struct {
     // --- LCC-specific ---
     quiet: bool = false,
     recycle_turns: ?u32 = null,
+    recycle_rss_mb: ?u32 = null,
+    compact: bool = false,
 
     // --- Passthrough: unknown flags forwarded directly to claude CLI ---
     extra_args: ?[]const []const u8 = null,
@@ -74,6 +76,7 @@ pub const Event = union(enum) {
     init: InitData,
     content_delta: []const u8,
     tool_start: ToolStartData,
+    tool_input_delta: []const u8,
     tool_result: ToolResultData,
     result: ResultData,
     unknown: void,
@@ -175,7 +178,11 @@ pub const Process = struct {
         if (config.disallowed_tools) |v| try appendFlag(&argv_list, parent_alloc, "--disallowed-tools", v);
 
         // --- Directories & files ---
-        if (config.add_dir) |v| try appendFlag(&argv_list, parent_alloc, "--add-dir", v);
+        if (config.add_dirs) |dirs| {
+            for (dirs) |d| {
+                try appendFlag(&argv_list, parent_alloc, "--add-dir", d);
+            }
+        }
         if (config.cwd) |v| try appendFlag(&argv_list, parent_alloc, "--cwd", v);
         if (config.file) |v| try appendFlag(&argv_list, parent_alloc, "--file", v);
 
@@ -468,6 +475,10 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) Event {
             if (std.mem.eql(u8, delta_type, "text_delta")) {
                 if (jh.getString(delta, "text")) |text| {
                     return .{ .content_delta = text };
+                }
+            } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
+                if (jh.getString(delta, "partial_json")) |pj| {
+                    return .{ .tool_input_delta = pj };
                 }
             }
         } else if (std.mem.eql(u8, inner_type, "content_block_start")) {

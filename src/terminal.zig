@@ -1,4 +1,5 @@
 const std = @import("std");
+const history_mod = @import("history.zig");
 
 pub const Color = struct {
     pub const reset = "\x1b[0m";
@@ -72,24 +73,51 @@ pub fn printSpinnerFrame(frame: usize) void {
     printStr(" " ++ Color.dim ++ "thinking..." ++ Color.reset);
 }
 
-/// Show animated tool spinner frame (overwrites current line)
-pub fn printToolSpinnerFrame(name: []const u8, frame: usize) void {
+/// Show animated tool spinner frame with optional context
+pub fn printToolSpinnerFrame(name: []const u8, context: []const u8, frame: usize) void {
     const f = spinner_frames[frame % spinner_frames.len];
     printStr(CLEAR_LINE ++ Color.cyan ++ "  ");
     printStr(f);
     printStr(" " ++ Color.bold);
     printStr(name);
+    if (context.len > 0) {
+        printStr(Color.reset ++ Color.dim ++ " ");
+        // Truncate context to ~60 chars
+        if (context.len > 60) {
+            printStr(context[0..60]);
+            printStr("...");
+        } else {
+            printStr(context);
+        }
+    }
     printStr(Color.reset);
 }
 
-/// Clear tool display (tool finished, remove from screen)
-pub fn printToolDone(_: []const u8) void {
+/// Clear tool display (tool finished)
+pub fn printToolDone(name: []const u8, context: []const u8) void {
+    // Show brief completion line instead of just clearing
+    printStr(CLEAR_LINE ++ Color.dim ++ "  ✓ ");
+    printStr(name);
+    if (context.len > 0) {
+        printStr(" ");
+        if (context.len > 70) {
+            printStr(context[0..70]);
+            printStr("...");
+        } else {
+            printStr(context);
+        }
+    }
+    printStr(Color.reset ++ "\n");
+}
+
+/// Clear tool display silently (for compact mode)
+pub fn printToolDoneCompact() void {
     printStr(CLEAR_LINE);
 }
 
 /// Print the user input prompt with command hints
 pub fn printPrompt() void {
-    printStr("\n" ++ Color.dim ++ "  /help /cost /retry /recycle /clear | exit" ++ Color.reset);
+    printStr("\n" ++ Color.dim ++ "  /help /cost /model /save /compact /recycle | exit" ++ Color.reset);
     printStr("\n" ++ Color.bold ++ Color.green ++ " > " ++ Color.reset);
 }
 
@@ -167,25 +195,301 @@ pub fn printSessionSummary(total_cost: f64, total_duration_ms: i64) void {
 /// Print REPL help
 pub fn printReplHelp() void {
     printStr("\n" ++ Color.bold ++ "  Commands:" ++ Color.reset ++ "\n");
-    printStr(Color.gray ++ "    /help           Show this help\n" ++ Color.reset);
-    printStr(Color.gray ++ "    /cost           Show session cost summary\n" ++ Color.reset);
-    printStr(Color.gray ++ "    /session        Show session info\n" ++ Color.reset);
-    printStr(Color.gray ++ "    /clear          Clear screen\n" ++ Color.reset);
-    printStr(Color.gray ++ "    /retry          Retry last message\n" ++ Color.reset);
-    printStr(Color.gray ++ "    /recycle        Restart claude process (frees memory)\n" ++ Color.reset);
-    printStr(Color.gray ++ "    /version        Show LCC version\n" ++ Color.reset);
-    printStr(Color.gray ++ "    exit, quit      Exit LCC\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /help              Show this help\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /cost              Show session cost summary\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /session           Show session info\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /model <name>      Switch model (restarts process)\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /save [file]       Save last response to file\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /compact           Toggle compact mode (hide tool details)\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /clear             Clear screen\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /retry             Retry last message\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /recycle           Restart claude process (frees memory)\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /version           Show LCC version\n" ++ Color.reset);
+    printStr(Color.gray ++ "    exit, quit         Exit LCC\n" ++ Color.reset);
     printStr("\n" ++ Color.gray ++ "  Input: type message, press Enter on empty line to send.\n" ++ Color.reset);
+    printStr(Color.gray ++ "  Up/Down arrows browse input history.\n" ++ Color.reset);
     printStr(Color.gray ++ "  Ctrl+C once to interrupt, twice to quit.\n" ++ Color.reset);
 }
 
-/// Read multiline input. Empty line sends. Returns null on EOF.
-/// Uses buffered reads for better performance.
-pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
-    const stdin = getStdin();
-    var lines: std.ArrayList(u8) = .empty;
+// --- Raw terminal mode for input history ---
 
-    // Use a read buffer to reduce syscalls
+const RawTerminal = struct {
+    orig: std.posix.termios,
+
+    fn enable() ?RawTerminal {
+        const orig = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return null;
+        var raw = orig;
+        // Disable canonical mode and echo; keep signal handling
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        // Read returns after 1 byte
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw) catch return null;
+        return .{ .orig = orig };
+    }
+
+    fn disable(self: *const RawTerminal) void {
+        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.orig) catch {};
+    }
+};
+
+/// Read a single line with history support using raw terminal mode.
+/// Returns the line content, or null on EOF.
+fn readLineRaw(alloc: std.mem.Allocator, hist: *history_mod.History) !?[]const u8 {
+    const raw = RawTerminal.enable() orelse {
+        // Fallback to simple line reading
+        return readSimpleLine(alloc);
+    };
+    defer raw.disable();
+
+    const stdin = getStdin();
+    var line: std.ArrayList(u8) = .empty;
+    var cursor: usize = 0;
+
+    while (true) {
+        var byte: [1]u8 = undefined;
+        const n = stdin.read(&byte) catch |err| {
+            if (err == error.BrokenPipe) return null;
+            return err;
+        };
+        if (n == 0) {
+            if (line.items.len > 0) {
+                return try line.toOwnedSlice(alloc);
+            }
+            return null;
+        }
+
+        switch (byte[0]) {
+            '\n', '\r' => {
+                printStr("\n");
+                return try line.toOwnedSlice(alloc);
+            },
+            // Ctrl+D: EOF
+            4 => {
+                if (line.items.len == 0) return null;
+            },
+            // Backspace / Ctrl+H
+            127, 8 => {
+                if (cursor > 0) {
+                    _ = line.orderedRemove(cursor - 1);
+                    cursor -= 1;
+                    // Redraw from cursor position
+                    redrawLine(line.items, cursor);
+                }
+            },
+            // Escape sequence
+            '\x1b' => {
+                var seq: [2]u8 = undefined;
+                const sn = stdin.read(&seq) catch continue;
+                if (sn < 2 or seq[0] != '[') continue;
+
+                switch (seq[1]) {
+                    // Up arrow
+                    'A' => {
+                        if (hist.prev()) |entry| {
+                            replaceLine(&line, alloc, entry, &cursor);
+                        }
+                    },
+                    // Down arrow
+                    'B' => {
+                        if (hist.next()) |entry| {
+                            replaceLine(&line, alloc, entry, &cursor);
+                        } else {
+                            replaceLine(&line, alloc, "", &cursor);
+                        }
+                    },
+                    // Right arrow
+                    'C' => {
+                        if (cursor < line.items.len) {
+                            cursor += 1;
+                            printStr("\x1b[C");
+                        }
+                    },
+                    // Left arrow
+                    'D' => {
+                        if (cursor > 0) {
+                            cursor -= 1;
+                            printStr("\x1b[D");
+                        }
+                    },
+                    // Home
+                    'H' => {
+                        if (cursor > 0) {
+                            print("\x1b[{d}D", .{cursor});
+                            cursor = 0;
+                        }
+                    },
+                    // End
+                    'F' => {
+                        if (cursor < line.items.len) {
+                            print("\x1b[{d}C", .{line.items.len - cursor});
+                            cursor = line.items.len;
+                        }
+                    },
+                    // Delete key: ESC [ 3 ~
+                    '3' => {
+                        var tilde: [1]u8 = undefined;
+                        _ = stdin.read(&tilde) catch {};
+                        if (cursor < line.items.len) {
+                            _ = line.orderedRemove(cursor);
+                            redrawLine(line.items, cursor);
+                        }
+                    },
+                    else => {},
+                }
+            },
+            // Ctrl+A: Home
+            1 => {
+                if (cursor > 0) {
+                    print("\x1b[{d}D", .{cursor});
+                    cursor = 0;
+                }
+            },
+            // Ctrl+E: End
+            5 => {
+                if (cursor < line.items.len) {
+                    print("\x1b[{d}C", .{line.items.len - cursor});
+                    cursor = line.items.len;
+                }
+            },
+            // Ctrl+U: Clear line
+            21 => {
+                replaceLine(&line, alloc, "", &cursor);
+            },
+            // Ctrl+K: Kill to end of line
+            11 => {
+                if (cursor < line.items.len) {
+                    line.items.len = cursor;
+                    // Clear from cursor to end
+                    printStr("\x1b[K");
+                }
+            },
+            // Ctrl+W: Delete word backwards
+            23 => {
+                if (cursor > 0) {
+                    var end = cursor;
+                    // Skip spaces
+                    while (end > 0 and line.items[end - 1] == ' ') : (end -= 1) {}
+                    // Skip word
+                    while (end > 0 and line.items[end - 1] != ' ') : (end -= 1) {}
+                    const removed = cursor - end;
+                    var j: usize = 0;
+                    while (j < removed) : (j += 1) {
+                        _ = line.orderedRemove(end);
+                    }
+                    cursor = end;
+                    redrawLine(line.items, cursor);
+                }
+            },
+            else => |c| {
+                // Printable characters
+                if (c >= 32 and c < 127) {
+                    line.insert(alloc, cursor, c) catch continue;
+                    cursor += 1;
+                    if (cursor == line.items.len) {
+                        // Simple append: just echo the char
+                        var buf: [1]u8 = .{c};
+                        printStr(&buf);
+                    } else {
+                        // Insert: need to redraw
+                        redrawLine(line.items, cursor);
+                    }
+                } else if (c >= 0xC0) {
+                    // UTF-8 multi-byte: read remaining bytes and insert all
+                    const utf8_len: usize = if (c < 0xE0) 2 else if (c < 0xF0) 3 else 4;
+                    var utf8_buf: [4]u8 = .{ c, 0, 0, 0 };
+                    const remaining = utf8_buf[1..utf8_len];
+                    const rn = stdin.read(remaining) catch continue;
+                    if (rn == utf8_len - 1) {
+                        var insert_ok = true;
+                        for (utf8_buf[0..utf8_len]) |ub| {
+                            line.insert(alloc, cursor, ub) catch {
+                                insert_ok = false;
+                                break;
+                            };
+                            cursor += 1;
+                        }
+                        if (insert_ok) {
+                            redrawLine(line.items, cursor);
+                        }
+                    }
+                }
+            },
+        }
+    }
+}
+
+fn replaceLine(line: *std.ArrayList(u8), alloc: std.mem.Allocator, new: []const u8, cursor: *usize) void {
+    // Move to start of input
+    if (cursor.* > 0) {
+        print("\x1b[{d}D", .{cursor.*});
+    }
+    // Clear from cursor to end
+    printStr("\x1b[K");
+    // Replace content
+    line.clearRetainingCapacity();
+    line.appendSlice(alloc, new) catch {};
+    cursor.* = new.len;
+    printStr(new);
+}
+
+fn redrawLine(line: []const u8, cursor: usize) void {
+    // Move to start of input
+    printStr("\r" ++ Color.bold ++ Color.green ++ " > " ++ Color.reset);
+    printStr(line);
+    printStr("\x1b[K"); // Clear rest of line
+    // Move cursor to correct position
+    const chars_after = line.len - cursor;
+    if (chars_after > 0) {
+        print("\x1b[{d}D", .{chars_after});
+    }
+}
+
+fn readSimpleLine(alloc: std.mem.Allocator) !?[]const u8 {
+    const stdin = getStdin();
+    var line: std.ArrayList(u8) = .empty;
+    var read_buf: [256]u8 = undefined;
+
+    while (true) {
+        const n = stdin.read(&read_buf) catch |err| {
+            if (err == error.BrokenPipe) return null;
+            return err;
+        };
+        if (n == 0) {
+            if (line.items.len > 0) return try line.toOwnedSlice(alloc);
+            return null;
+        }
+        for (read_buf[0..n]) |c| {
+            if (c == '\n') {
+                return try line.toOwnedSlice(alloc);
+            }
+            if (c != '\r') {
+                try line.append(alloc, c);
+            }
+        }
+    }
+}
+
+/// Read multiline input with history support.
+/// First line uses raw mode with arrow key history.
+/// Empty line sends. Returns null on EOF.
+pub fn readMultilineInput(alloc: std.mem.Allocator, hist: *history_mod.History) !?[]const u8 {
+    // Read first line with history support
+    const first_line = try readLineRaw(alloc, hist) orelse return null;
+
+    if (first_line.len == 0) {
+        alloc.free(first_line);
+        return try alloc.dupe(u8, "");
+    }
+
+    var lines: std.ArrayList(u8) = .empty;
+    try lines.appendSlice(alloc, first_line);
+    alloc.free(first_line);
+
+    // Read continuation lines (cooked mode, simpler)
+    printContinuation();
+    const stdin = getStdin();
     var read_buf: [256]u8 = undefined;
     var read_pos: usize = 0;
     var read_len: usize = 0;
@@ -195,16 +499,14 @@ pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
         defer line.deinit(alloc);
 
         while (true) {
-            // Read from buffer, refill if empty
             if (read_pos >= read_len) {
                 read_len = stdin.read(&read_buf) catch |err| {
-                    if (err == error.BrokenPipe) return null;
+                    if (err == error.BrokenPipe) return try lines.toOwnedSlice(alloc);
                     return err;
                 };
                 read_pos = 0;
                 if (read_len == 0) {
-                    if (lines.items.len > 0) return try lines.toOwnedSlice(alloc);
-                    return null;
+                    return try lines.toOwnedSlice(alloc);
                 }
             }
 
@@ -217,13 +519,12 @@ pub fn readMultilineInput(alloc: std.mem.Allocator) !?[]const u8 {
         }
 
         if (line.items.len == 0) {
-            if (lines.items.len > 0) return try lines.toOwnedSlice(alloc);
-            return try alloc.dupe(u8, "");
+            // Empty line: submit
+            return try lines.toOwnedSlice(alloc);
         }
 
-        if (lines.items.len > 0) try lines.append(alloc, '\n');
+        try lines.append(alloc, '\n');
         try lines.appendSlice(alloc, line.items);
-
         printContinuation();
     }
 }
@@ -245,4 +546,11 @@ pub fn readPipedInput(alloc: std.mem.Allocator) !?[]const u8 {
 
     if (buf.items.len == 0) return null;
     return try buf.toOwnedSlice(alloc);
+}
+
+/// Write content to a file (for /save command)
+pub fn writeFile(path: []const u8, content: []const u8) !void {
+    const file = try std.fs.createFileAbsolute(path, .{});
+    defer file.close();
+    try file.writeAll(content);
 }

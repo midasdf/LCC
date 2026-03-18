@@ -1,6 +1,7 @@
 const std = @import("std");
 const terminal = @import("terminal.zig");
 const claude_cli = @import("claude_cli.zig");
+const markdown = @import("markdown.zig");
 
 /// Default: recycle after 10 turns
 const default_recycle_interval: u32 = 10;
@@ -14,9 +15,16 @@ pub const Agent = struct {
     total_cost_usd: f64,
     total_duration_ms: i64,
     last_message: ?[]const u8,
+    last_response: ?[]const u8,
     got_init: bool,
     turn_count: u32,
     recycle_interval: u32,
+    recycle_rss_mb: ?u32,
+    compact: bool,
+    md: markdown.MarkdownRenderer,
+    // Tool input accumulator
+    tool_input_buf: std.ArrayList(u8),
+    model_owned: bool, // whether config.model was alloc'd by us
 
     pub fn init(alloc: std.mem.Allocator, config: claude_cli.Config, interrupted: *std.atomic.Value(bool)) Agent {
         return .{
@@ -28,9 +36,15 @@ pub const Agent = struct {
             .total_cost_usd = 0,
             .total_duration_ms = 0,
             .last_message = null,
+            .last_response = null,
             .got_init = false,
             .turn_count = 0,
             .recycle_interval = config.recycle_turns orelse default_recycle_interval,
+            .recycle_rss_mb = config.recycle_rss_mb,
+            .compact = config.compact,
+            .md = markdown.MarkdownRenderer.init(alloc),
+            .tool_input_buf = .empty,
+            .model_owned = false,
         };
     }
 
@@ -82,14 +96,30 @@ pub const Agent = struct {
         self.last_message = self.alloc.dupe(u8, msg) catch null;
     }
 
+    /// Save last response for /save
+    fn saveLastResponse(self: *Agent, resp: []const u8) void {
+        if (self.last_response) |old| {
+            self.alloc.free(old);
+        }
+        self.last_response = self.alloc.dupe(u8, resp) catch null;
+    }
+
     /// Get last message (for /retry)
     pub fn getLastMessage(self: *const Agent) ?[]const u8 {
         return self.last_message;
     }
 
-    /// Get session ID (for /session display)
-    pub fn getSessionId(self: *const Agent) ?[]const u8 {
-        return self.session_id;
+    /// Get last response (for /save)
+    pub fn getLastResponse(self: *const Agent) ?[]const u8 {
+        return self.last_response;
+    }
+
+    /// Extract useful context from accumulated tool input JSON
+    fn extractToolContext(self: *const Agent) []const u8 {
+        const input = self.tool_input_buf.items;
+        if (input.len == 0) return "";
+        // Return raw input, truncated — it's already informative
+        return input;
     }
 
     /// Send a user message and stream the response
@@ -110,6 +140,10 @@ pub const Agent = struct {
         var current_tool: ?[]const u8 = null;
         var spinner_frame: usize = 0;
         var spinner_active = true;
+        var response_buf: std.ArrayList(u8) = .empty;
+
+        // Reset markdown renderer for new turn
+        self.md.reset();
 
         // Show initial spinner
         terminal.printSpinnerFrame(0);
@@ -121,6 +155,7 @@ pub const Agent = struct {
                 proc.kill();
                 self.process = null;
                 terminal.printStr(terminal.Color.yellow ++ "\n  [interrupted]" ++ terminal.Color.reset ++ "\n");
+                response_buf.deinit(self.alloc);
                 return;
             }
 
@@ -131,8 +166,8 @@ pub const Agent = struct {
                 .timeout => {
                     spinner_frame += 1;
                     if (current_tool) |tn| {
-                        // Animate tool spinner
-                        terminal.printToolSpinnerFrame(tn, spinner_frame);
+                        // Animate tool spinner with context
+                        terminal.printToolSpinnerFrame(tn, self.extractToolContext(), spinner_frame);
                     } else if (spinner_active and !got_first_content) {
                         // Animate thinking spinner
                         terminal.printSpinnerFrame(spinner_frame);
@@ -145,6 +180,11 @@ pub const Agent = struct {
                     self.process = null;
                     terminal.printStr(terminal.Color.yellow ++ "\n  [process ended unexpectedly]" ++ terminal.Color.reset ++ "\n");
                     terminal.printStr(terminal.Color.gray ++ "  Will restart on next message." ++ terminal.Color.reset ++ "\n");
+                    self.md.flush();
+                    if (response_buf.items.len > 0) {
+                        self.saveLastResponse(response_buf.items);
+                    }
+                    response_buf.deinit(self.alloc);
                     return;
                 },
                 .event => |event| {
@@ -155,30 +195,51 @@ pub const Agent = struct {
                                 spinner_active = false;
                                 terminal.clearSpinner();
                                 if (current_tool) |tn| {
-                                    terminal.printToolDone(tn);
+                                    if (self.compact) {
+                                        terminal.printToolDoneCompact();
+                                    } else {
+                                        terminal.printToolDone(tn, self.extractToolContext());
+                                    }
                                     self.alloc.free(tn);
                                     current_tool = null;
+                                    self.tool_input_buf.clearRetainingCapacity();
                                 }
                                 terminal.printResponseHeader();
                             }
-                            terminal.printStreaming(text);
+                            // Feed through markdown renderer
+                            self.md.feed(text);
+                            // Accumulate for /save
+                            response_buf.appendSlice(self.alloc, text) catch {};
                         },
                         .tool_start => |data| {
                             spinner_active = false;
+                            // Finish previous tool if any
                             if (current_tool) |tn| {
+                                if (self.compact) {
+                                    terminal.printToolDoneCompact();
+                                } else {
+                                    terminal.printToolDone(tn, self.extractToolContext());
+                                }
                                 self.alloc.free(tn);
                             }
                             current_tool = self.alloc.dupe(u8, data.name) catch null;
+                            self.tool_input_buf.clearRetainingCapacity();
                             got_first_content = false;
                             spinner_frame = 0;
-                            terminal.printToolSpinnerFrame(data.name, 0);
+                            if (!self.compact) {
+                                terminal.printToolSpinnerFrame(data.name, "", 0);
+                            }
+                        },
+                        .tool_input_delta => |partial| {
+                            // Accumulate tool input JSON for context display
+                            if (self.tool_input_buf.items.len < 200) {
+                                self.tool_input_buf.appendSlice(self.alloc, partial) catch {};
+                            }
                         },
                         .tool_result => {
                             // tool_result events handled via tool_start/done flow
                         },
                         .init => |data| {
-                            // Only show session info on first init event
-                            // Clear spinner before showing session info
                             if (spinner_active) {
                                 terminal.clearSpinner();
                                 spinner_active = false;
@@ -190,7 +251,6 @@ pub const Agent = struct {
                                     terminal.printSessionInfo(data.session_id, data.model);
                                 }
                             } else {
-                                // Still save session_id for subsequent inits
                                 self.saveSessionId(data.session_id);
                             }
                         },
@@ -200,14 +260,27 @@ pub const Agent = struct {
                                 spinner_active = false;
                             }
                             if (current_tool) |tn| {
-                                terminal.printToolDone(tn);
+                                if (self.compact) {
+                                    terminal.printToolDoneCompact();
+                                } else {
+                                    terminal.printToolDone(tn, self.extractToolContext());
+                                }
                                 self.alloc.free(tn);
                             }
+
+                            // Flush markdown renderer
+                            self.md.flush();
 
                             self.saveSessionId(data.session_id);
                             self.total_cost_usd += data.cost_usd;
                             self.total_duration_ms += data.duration_ms;
                             self.turn_count += 1;
+
+                            // Save response for /save
+                            if (response_buf.items.len > 0) {
+                                self.saveLastResponse(response_buf.items);
+                            }
+                            response_buf.deinit(self.alloc);
 
                             if (data.is_error) {
                                 terminal.printError("{s}", .{data.result_text});
@@ -217,10 +290,22 @@ pub const Agent = struct {
 
                             // Reset turn arena
                             proc.resetTurnArena();
+                            self.tool_input_buf.clearRetainingCapacity();
 
-                            // Auto-recycle process to prevent memory bloat
+                            // Auto-recycle: turn-based
                             if (self.recycle_interval > 0 and self.turn_count >= self.recycle_interval) {
                                 self.recycleProcess();
+                                return;
+                            }
+
+                            // Auto-recycle: RSS-based
+                            if (self.recycle_rss_mb) |threshold| {
+                                if (self.getChildRssKb()) |rss_kb| {
+                                    if (rss_kb / 1024 >= threshold) {
+                                        terminal.print(terminal.Color.gray ++ "  [RSS {d}MB >= {d}MB threshold]" ++ terminal.Color.reset ++ "\n", .{ rss_kb / 1024, threshold });
+                                        self.recycleProcess();
+                                    }
+                                }
                             }
 
                             return;
@@ -252,7 +337,6 @@ pub const Agent = struct {
     }
 
     /// Recycle the claude CLI process to free Node.js memory.
-    /// Session is preserved via session_id — ensureProcess() handles restart.
     pub fn recycleProcess(self: *Agent) void {
         if (self.process) |*proc| {
             proc.deinit();
@@ -260,6 +344,29 @@ pub const Agent = struct {
         }
         self.turn_count = 0;
         terminal.printStr(terminal.Color.gray ++ "  [recycled: claude process restarted to free memory]" ++ terminal.Color.reset ++ "\n");
+    }
+
+    /// Switch model (for /model command)
+    pub fn setModel(self: *Agent, model: []const u8) void {
+        if (self.model_owned) {
+            if (self.config.model) |old| {
+                self.alloc.free(old);
+            }
+        }
+        self.config.model = self.alloc.dupe(u8, model) catch return;
+        self.model_owned = true;
+        terminal.print(terminal.Color.cyan ++ "  Model changed to: {s}" ++ terminal.Color.reset ++ "\n", .{model});
+        self.recycleProcess();
+    }
+
+    /// Toggle compact mode
+    pub fn toggleCompact(self: *Agent) void {
+        self.compact = !self.compact;
+        if (self.compact) {
+            terminal.printStr(terminal.Color.gray ++ "  Compact mode: ON (tool details hidden)" ++ terminal.Color.reset ++ "\n");
+        } else {
+            terminal.printStr(terminal.Color.gray ++ "  Compact mode: OFF (tool details shown)" ++ terminal.Color.reset ++ "\n");
+        }
     }
 
     /// Get RSS of the child process in KB (Linux /proc/pid/statm)
@@ -277,8 +384,6 @@ pub const Agent = struct {
         const n = file.read(&buf) catch return null;
         const content = buf[0..n];
 
-        // statm format: "size resident shared ..."
-        // We want the 2nd field (resident) in pages
         var it = std.mem.splitScalar(u8, content, ' ');
         _ = it.next(); // skip size
         const rss_str = it.next() orelse return null;
@@ -312,6 +417,7 @@ pub const Agent = struct {
             terminal.printStr(terminal.Color.yellow ++ "    status: disconnected" ++ terminal.Color.reset ++ "\n");
         }
         terminal.print(terminal.Color.gray ++ "    turns: {d}/{d} (next recycle)" ++ terminal.Color.reset ++ "\n", .{ self.turn_count, self.recycle_interval });
+        terminal.print(terminal.Color.gray ++ "    compact: {s}" ++ terminal.Color.reset ++ "\n", .{if (self.compact) "on" else "off"});
     }
 
     /// Graceful shutdown
@@ -324,6 +430,17 @@ pub const Agent = struct {
             self.alloc.free(lm);
             self.last_message = null;
         }
+        if (self.last_response) |lr| {
+            self.alloc.free(lr);
+            self.last_response = null;
+        }
+        if (self.model_owned) {
+            if (self.config.model) |m| {
+                self.alloc.free(m);
+                self.config.model = null;
+            }
+        }
+        self.tool_input_buf.deinit(self.alloc);
         terminal.printSessionSummary(self.total_cost_usd, self.total_duration_ms);
     }
 };
