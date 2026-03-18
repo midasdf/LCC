@@ -2,24 +2,71 @@ const std = @import("std");
 const jh = @import("json_helper.zig");
 const terminal = @import("terminal.zig");
 
-/// Configuration for the claude CLI process
+/// Configuration for the claude CLI process.
+/// Maps 1:1 to claude CLI flags where applicable.
 pub const Config = struct {
+    // --- Model & behavior ---
     model: ?[]const u8 = null,
+    fallback_model: ?[]const u8 = null,
+    effort: ?[]const u8 = null,
     max_turns: ?u32 = null,
+    max_budget_usd: ?[]const u8 = null,
+    permission_mode: ?[]const u8 = null,
+    json_schema: ?[]const u8 = null,
+
+    // --- Session management ---
+    continue_session: bool = false,
     resume_session_id: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    fork_session: bool = false,
+    session_name: ?[]const u8 = null,
+    no_session_persistence: bool = false,
+
+    // --- System prompt ---
     system_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
+
+    // --- Tools ---
+    tools: ?[]const u8 = null,
     allowed_tools: ?[]const u8 = null,
     disallowed_tools: ?[]const u8 = null,
-    permission_mode: ?[]const u8 = null,
-    continue_session: bool = false,
-    effort: ?[]const u8 = null,
-    max_budget_usd: ?[]const u8 = null,
-    tools: ?[]const u8 = null,
+
+    // --- Directories & files ---
     add_dir: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
+    file: ?[]const u8 = null,
+
+    // --- Agents ---
+    agent: ?[]const u8 = null,
+    agents: ?[]const u8 = null,
+
+    // --- MCP ---
+    mcp_config: ?[]const u8 = null,
+    strict_mcp_config: bool = false,
+
+    // --- Plugins & settings ---
+    plugin_dir: ?[]const u8 = null,
+    settings: ?[]const u8 = null,
+    setting_sources: ?[]const u8 = null,
+
+    // --- Permissions ---
+    dangerously_skip_permissions: bool = false,
+    allow_dangerously_skip_permissions: bool = false,
+
+    // --- Beta & debug ---
+    betas: ?[]const u8 = null,
+    verbose: bool = true, // LCC defaults to verbose for stream-json
+    debug: bool = false,
+
+    // --- Worktree ---
+    worktree: ?[]const u8 = null, // null = disabled, "" = auto-name, "name" = named
+
+    // --- LCC-specific ---
     quiet: bool = false,
     recycle_turns: ?u32 = null,
-    debug: bool = false,
+
+    // --- Passthrough: unknown flags forwarded directly to claude CLI ---
+    extra_args: ?[]const []const u8 = null,
 };
 
 /// Events parsed from claude CLI stream-json output
@@ -71,69 +118,107 @@ pub const Process = struct {
         return self.arena.allocator();
     }
 
+    /// Helper to append a flag + value pair
+    fn appendFlag(argv_list: *std.ArrayList([]const u8), alloc: std.mem.Allocator, flag: []const u8, value: []const u8) !void {
+        try argv_list.append(alloc, flag);
+        try argv_list.append(alloc, value);
+    }
+
     pub fn start(parent_alloc: std.mem.Allocator, config: Config) !Process {
         var argv_list: std.ArrayList([]const u8) = .empty;
 
+        // Base flags: always present
         try argv_list.append(parent_alloc, "claude");
         try argv_list.append(parent_alloc, "-p");
-        try argv_list.append(parent_alloc, "--output-format");
-        try argv_list.append(parent_alloc, "stream-json");
-        try argv_list.append(parent_alloc, "--input-format");
-        try argv_list.append(parent_alloc, "stream-json");
-        try argv_list.append(parent_alloc, "--verbose");
+        try appendFlag(&argv_list, parent_alloc, "--output-format", "stream-json");
+        try appendFlag(&argv_list, parent_alloc, "--input-format", "stream-json");
         try argv_list.append(parent_alloc, "--include-partial-messages");
 
-        if (config.model) |m| {
-            try argv_list.append(parent_alloc, "--model");
-            try argv_list.append(parent_alloc, m);
+        if (config.verbose) {
+            try argv_list.append(parent_alloc, "--verbose");
         }
+
+        // --- Model & behavior ---
+        if (config.model) |v| try appendFlag(&argv_list, parent_alloc, "--model", v);
+        if (config.fallback_model) |v| try appendFlag(&argv_list, parent_alloc, "--fallback-model", v);
+        if (config.effort) |v| try appendFlag(&argv_list, parent_alloc, "--effort", v);
         if (config.max_turns) |mt| {
             const s = try std.fmt.allocPrint(parent_alloc, "{d}", .{mt});
-            try argv_list.append(parent_alloc, "--max-turns");
-            try argv_list.append(parent_alloc, s);
+            try appendFlag(&argv_list, parent_alloc, "--max-turns", s);
         }
+        if (config.max_budget_usd) |v| try appendFlag(&argv_list, parent_alloc, "--max-budget-usd", v);
+        if (config.permission_mode) |v| try appendFlag(&argv_list, parent_alloc, "--permission-mode", v);
+        if (config.json_schema) |v| try appendFlag(&argv_list, parent_alloc, "--json-schema", v);
+
+        // --- Session management ---
         if (config.continue_session) {
             try argv_list.append(parent_alloc, "--continue");
         }
-        if (config.resume_session_id) |sid| {
-            try argv_list.append(parent_alloc, "--resume");
-            try argv_list.append(parent_alloc, sid);
+        if (config.resume_session_id) |v| try appendFlag(&argv_list, parent_alloc, "--resume", v);
+        if (config.session_id) |v| try appendFlag(&argv_list, parent_alloc, "--session-id", v);
+        if (config.fork_session) {
+            try argv_list.append(parent_alloc, "--fork-session");
         }
-        if (config.system_prompt) |sp| {
-            try argv_list.append(parent_alloc, "--append-system-prompt");
-            try argv_list.append(parent_alloc, sp);
+        if (config.session_name) |v| try appendFlag(&argv_list, parent_alloc, "--name", v);
+        if (config.no_session_persistence) {
+            try argv_list.append(parent_alloc, "--no-session-persistence");
         }
-        if (config.allowed_tools) |at| {
-            try argv_list.append(parent_alloc, "--allowedTools");
-            try argv_list.append(parent_alloc, at);
+
+        // --- System prompt ---
+        // --system-prompt replaces default; --append-system-prompt appends
+        if (config.system_prompt) |v| try appendFlag(&argv_list, parent_alloc, "--system-prompt", v);
+        if (config.append_system_prompt) |v| try appendFlag(&argv_list, parent_alloc, "--append-system-prompt", v);
+
+        // --- Tools ---
+        if (config.tools) |v| try appendFlag(&argv_list, parent_alloc, "--tools", v);
+        if (config.allowed_tools) |v| try appendFlag(&argv_list, parent_alloc, "--allowedTools", v);
+        if (config.disallowed_tools) |v| try appendFlag(&argv_list, parent_alloc, "--disallowed-tools", v);
+
+        // --- Directories & files ---
+        if (config.add_dir) |v| try appendFlag(&argv_list, parent_alloc, "--add-dir", v);
+        if (config.cwd) |v| try appendFlag(&argv_list, parent_alloc, "--cwd", v);
+        if (config.file) |v| try appendFlag(&argv_list, parent_alloc, "--file", v);
+
+        // --- Agents ---
+        if (config.agent) |v| try appendFlag(&argv_list, parent_alloc, "--agent", v);
+        if (config.agents) |v| try appendFlag(&argv_list, parent_alloc, "--agents", v);
+
+        // --- MCP ---
+        if (config.mcp_config) |v| try appendFlag(&argv_list, parent_alloc, "--mcp-config", v);
+        if (config.strict_mcp_config) {
+            try argv_list.append(parent_alloc, "--strict-mcp-config");
         }
-        if (config.disallowed_tools) |dt| {
-            try argv_list.append(parent_alloc, "--disallowed-tools");
-            try argv_list.append(parent_alloc, dt);
+
+        // --- Plugins & settings ---
+        if (config.plugin_dir) |v| try appendFlag(&argv_list, parent_alloc, "--plugin-dir", v);
+        if (config.settings) |v| try appendFlag(&argv_list, parent_alloc, "--settings", v);
+        if (config.setting_sources) |v| try appendFlag(&argv_list, parent_alloc, "--setting-sources", v);
+
+        // --- Permissions ---
+        if (config.dangerously_skip_permissions) {
+            try argv_list.append(parent_alloc, "--dangerously-skip-permissions");
         }
-        if (config.permission_mode) |pm| {
-            try argv_list.append(parent_alloc, "--permission-mode");
-            try argv_list.append(parent_alloc, pm);
+        if (config.allow_dangerously_skip_permissions) {
+            try argv_list.append(parent_alloc, "--allow-dangerously-skip-permissions");
         }
-        if (config.effort) |e| {
-            try argv_list.append(parent_alloc, "--effort");
-            try argv_list.append(parent_alloc, e);
+
+        // --- Beta ---
+        if (config.betas) |v| try appendFlag(&argv_list, parent_alloc, "--betas", v);
+
+        // --- Worktree ---
+        if (config.worktree) |v| {
+            if (v.len > 0) {
+                try appendFlag(&argv_list, parent_alloc, "--worktree", v);
+            } else {
+                try argv_list.append(parent_alloc, "--worktree");
+            }
         }
-        if (config.max_budget_usd) |b| {
-            try argv_list.append(parent_alloc, "--max-budget-usd");
-            try argv_list.append(parent_alloc, b);
-        }
-        if (config.tools) |t| {
-            try argv_list.append(parent_alloc, "--tools");
-            try argv_list.append(parent_alloc, t);
-        }
-        if (config.add_dir) |d| {
-            try argv_list.append(parent_alloc, "--add-dir");
-            try argv_list.append(parent_alloc, d);
-        }
-        if (config.cwd) |c| {
-            try argv_list.append(parent_alloc, "--cwd");
-            try argv_list.append(parent_alloc, c);
+
+        // --- Passthrough extra args ---
+        if (config.extra_args) |extras| {
+            for (extras) |arg| {
+                try argv_list.append(parent_alloc, arg);
+            }
         }
 
         // Initial prompt required by -p; use empty string since we send via stdin
@@ -263,8 +348,8 @@ pub const Process = struct {
         }
 
         // Data available, read it
-        var buf: [4096]u8 = undefined;
-        const n = stdout.read(&buf) catch |err| {
+        var read_buf: [4096]u8 = undefined;
+        const n = stdout.read(&read_buf) catch |err| {
             if (err == error.Unexpected) return .eof;
             self.alive = false;
             return .eof;
@@ -274,7 +359,7 @@ pub const Process = struct {
             return .eof;
         }
 
-        self.line_buf.appendSlice(self.parent_alloc, buf[0..n]) catch return .eof;
+        self.line_buf.appendSlice(self.parent_alloc, read_buf[0..n]) catch return .eof;
 
         // Try to parse a line from the updated buffer
         if (self.tryParseLine(alloc)) |event| {

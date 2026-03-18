@@ -135,10 +135,13 @@ pub fn printCost(turn_cost: f64, duration_ms: i64, total_cost: f64) void {
 }
 
 /// Print the startup banner
-pub fn printBanner(model: ?[]const u8) void {
+pub fn printBanner(model: ?[]const u8, name: ?[]const u8) void {
     printStr("\n");
     printStr(Color.bold ++ Color.cyan ++ "  LCC" ++ Color.reset ++ " - Lightweight Claude Code\n");
     printSeparator();
+    if (name) |n| {
+        print(Color.gray ++ "  session: {s}" ++ Color.reset ++ "\n", .{n});
+    }
     if (model) |m| {
         print(Color.gray ++ "  model: {s}" ++ Color.reset ++ "\n", .{m});
     }
@@ -170,6 +173,7 @@ pub fn printReplHelp() void {
     printStr(Color.gray ++ "    /clear          Clear screen\n" ++ Color.reset);
     printStr(Color.gray ++ "    /retry          Retry last message\n" ++ Color.reset);
     printStr(Color.gray ++ "    /recycle        Restart claude process (frees memory)\n" ++ Color.reset);
+    printStr(Color.gray ++ "    /version        Show LCC version\n" ++ Color.reset);
     printStr(Color.gray ++ "    exit, quit      Exit LCC\n" ++ Color.reset);
     printStr("\n" ++ Color.gray ++ "  Input: type message, press Enter on empty line to send.\n" ++ Color.reset);
     printStr(Color.gray ++ "  Ctrl+C once to interrupt, twice to quit.\n" ++ Color.reset);
